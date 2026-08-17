@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SPDX-License-Identifier: MPL-2.0
+
+  Privacy manifest. Required by App Store Connect: without one, uploads draw ITMS-91053 warnings and
+  the privacy report Apple generates for the listing cannot be assembled.
+
+  All four keys are declared explicitly, including the empty ones. An absent key and an empty array
+  mean the same thing to Apple's tooling but not to a reader — "we collect nothing" and "nobody filled
+  this in" would otherwise be the same file — and this app genuinely collects nothing.
+
+    NSPrivacyTracking            false  no tracking of any kind.
+    NSPrivacyTrackingDomains     empty  nothing to list. There are no third-party SDKs at all;
+                                        Package.swift declares no .package(url:) dependencies, so
+                                        there are no vendored manifests to reconcile with this one.
+    NSPrivacyCollectedDataTypes  empty  the food journal never leaves the device. It is a JSON file in
+                                        Application Support written by App/Model/Journal.swift, and the
+                                        only network calls are GET /ingredients/search and
+                                        POST /nutrition, which send a food name, a weight and a cooking
+                                        method — no identifier, no account, no device data.
+    NSPrivacyAccessedAPITypes    empty  see below.
+
+  On the last one, because an empty array here is a claim and not a default: the required-reason API
+  categories are file timestamp, system boot time, disk space, active keyboard and user defaults.
+  Journal.swift is the only file touching the filesystem and it uses exactly four calls —
+  FileManager.urls(for:in:), createDirectory, removeItem and moveItem. None of those is a
+  required-reason API: it never reads a creation or modification date, never inspects free space, and
+  UserDefaults appears nowhere in the target. Declaring a category anyway — C617.1 for timestamps, or
+  E174.1 for disk space — would be over-declaring, which misdescribes the app just as surely as
+  under-declaring does.
+
+  Recheck this file if Journal.swift ever sorts by file date, reports free space, or if UserDefaults
+  arrives with a settings screen.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array/>
+</dict>
+</plist>

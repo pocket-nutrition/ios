@@ -1,0 +1,25 @@
+// Per-developer signing. Copy to Local.xcconfig, which is gitignored, and set your own team:
+//
+//     cp Local.xcconfig.example Local.xcconfig
+//
+// Xcode reads it as the base configuration for both Debug and Release, so DEVELOPMENT_TEAM stays out
+// of project.pbxproj and a fresh checkout signs as nobody until its owner says otherwise.
+//
+// The copy is required, not optional. A missing base configuration is a hard error — every Xcode
+// build stops before compiling with "Unable to open base configuration reference file" — which is
+// the point: the project refuses to build rather than quietly signing as the wrong team. swift test
+// is unaffected, since the package never goes through Xcode.
+//
+// A team identifier is not a secret; it is readable inside every signed binary Apple distributes.
+// It is kept out of the tree because it is *wrong for everyone else*, not because it is sensitive.
+// Genuine signing material — certificates, private keys, provisioning profiles, App Store Connect
+// keys — is listed in .gitignore and must never be committed.
+//
+// Find yours in Xcode under Settings → Accounts → your Apple ID → the Team ID column, or run:
+//
+//     security find-identity -v -p codesigning
+//
+// A free Apple ID gets a Personal Team: builds last 7 days and are capped at three apps per device.
+// The Apple Developer Program is required only for TestFlight and the App Store.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID

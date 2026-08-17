@@ -1,0 +1,34 @@
+# SwiftPM. .build alone is ~175 MB, so this matters from the first commit rather than later.
+.build/
+.swiftpm/
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.moved-aside
+
+# Per-developer signing team. Local.xcconfig.example is the committed template; see it for why a team
+# identifier is kept out of the tree despite not being a secret.
+Local.xcconfig
+
+# APPLE SIGNING MATERIAL — never commit.
+#
+# Listed from the first commit rather than after the first accident: a committed certificate, private
+# key or App Store Connect API key is a compromised credential, not a tidy-up job. It has to be revoked
+# and reissued, not merely deleted from the tree — the same rule the android repo applies to *.jks.
+#
+# AuthKey_*.p8 is the App Store Connect API key: it is issued once, cannot be re-downloaded, and grants
+# upload rights to the whole account.
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+ExportOptions.plist
+AuthKey_*.p8
+
+# macOS
+.DS_Store
