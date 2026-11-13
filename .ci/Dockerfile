@@ -12,7 +12,7 @@
 # anyway. Adding an Apple-only import to PocketNutritionCore silently removes it from CI, which is why
 # Package.swift says so too.
 #
-# Built and pushed by .gitea/workflows/ci-image.yml, only when this file changes.
+# Used to reproduce CI locally (see CONTRIBUTING.md). The GitHub workflow runs the official swift image instead.
 
 # Pinned to the exact toolchain the package was developed against — Apple Swift 6.3.3 — so that a CI
 # result and a local result mean the same thing. An unpinned image is a build that changes under you.
@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # NODE IS NOT OPTIONAL, even though nothing in this project is JavaScript.
 #
-# Gitea Actions runs JavaScript actions — actions/checkout@v4 and friends — *inside* the job container,
+# Container-based CI runners run JavaScript actions — actions/checkout@v4 and friends — *inside* the job container,
 # using a `node` binary it expects to find there. Without it every container job dies at checkout with:
 #
 #     exec: "node": executable file not found in $PATH   (exit 127)

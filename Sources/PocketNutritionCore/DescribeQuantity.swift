@@ -71,11 +71,12 @@ public struct QuantityDescription: Equatable, Sendable {
 /// specifically *not* to the portion-ratio branch. Flattening those two into sibling conditions
 /// changes what a 10 g sliver of carrot reads as.
 ///
-/// Pinned by the `describe-quantity` suite of the shared behavioural corpus.
+/// Pinned by the `describe-quantity`/`describe-quantity-en` suites of the shared behavioural corpus.
 public func describeQuantity(
     currentG: Double,
     anchors: [QuantityAnchor],
-    context: QuantityContext
+    context: QuantityContext,
+    lang: String
 ) -> QuantityDescription {
     let weight = formatWeight(currentG, displayUnit: context.displayUnit)
 
@@ -98,25 +99,27 @@ public func describeQuantity(
         let count = currentG / itemUnitG
         if count >= minimumItemCount {
             let rounded = roundToOneDecimal(count)
-            let label = frenchPlural(itemLabel, count: rounded)
+            let label = pluralize(itemLabel, count: rounded, lang: lang)
             return QuantityDescription(
-                primary: "≈ \(formatFrenchNumber(rounded)) \(label)",
+                primary: "≈ \(formatNumber(rounded, lang: lang)) \(label)",
                 secondary: weight
             )
         }
         // Deliberately falls through to branch 3, not to the portion ratio below.
     } else if context.portionG > 0 {
         let ratio = currentG / context.portionG
-        if let named = namedFactors.first(where: {
+        if let named = namedFactors(for: lang).first(where: {
             abs(ratio - $0.factor) / $0.factor <= namedTolerance
         }) {
             return QuantityDescription(primary: "≈ \(named.label)", secondary: weight)
         }
         let rounded = roundToOneDecimal(ratio)
-        // "portion" is pluralised by the same French rule as everything else. No vector reaches a
-        // ratio of 2 or more, so this is the consistent choice rather than a pinned one.
+        // "portion"/"serving" is pluralised by the same rule as everything else in the active
+        // language. No vector reaches a ratio of 2 or more, so this is the consistent choice rather
+        // than a pinned one.
+        let portionWord = lang == "en" ? "serving" : "portion"
         return QuantityDescription(
-            primary: "≈ \(formatFrenchNumber(rounded)) \(frenchPlural("portion", count: rounded))",
+            primary: "≈ \(formatNumber(rounded, lang: lang)) \(pluralize(portionWord, count: rounded, lang: lang))",
             secondary: weight
         )
     }

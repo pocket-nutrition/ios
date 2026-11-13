@@ -32,8 +32,25 @@ extension MealIngredient {
     }
 
     /// The journal's persisted shape. Drops the portion model deliberately — see the note above.
+    /// A quick-add row: an energy figure typed in the search field, with no ingredient behind it. Held in
+    /// the builder as a row whose unit is "kcal" and quantity the energy, and never sent to the server.
+    var isQuickAddRow: Bool { unit == "kcal" }
+
+    static func quickAdd(kcal: Double, id: String) -> MealIngredient {
+        MealIngredient(
+            id: id, label: "\(roundHalfUp(kcal)) kcal", ingredientId: "quick-add:\(id)", cookingMethod: "",
+            quantity: kcal, unit: "kcal", measuredState: "", basePortionG: kcal, portionFactor: 1,
+            servingUnits: [], selectedUnit: nil, unitCount: 1, displayUnit: "kcal", canEatRaw: nil,
+            yieldFactors: [:], imageUrl: nil, servingMode: nil)
+    }
+
     func asMealItem() -> MealItem {
-        MealItem(
+        if isQuickAddRow {
+            return MealItem(
+                ingredientId: nil, label: label, quantityG: 0, cookingMethod: "", measuredState: "",
+                energyKcal: quantity)
+        }
+        return MealItem(
             ingredientId: ingredientId,
             label: label,
             quantityG: quantity,
@@ -48,32 +65,34 @@ extension MealIngredient {
     /// `stepRawWeight` and `stepLabel`, both corpus functions. Resolving the weight here rather than in
     /// the view is what keeps `step-raw-weight`'s rule — unit steps ignore the base portion entirely —
     /// from being re-derived by hand somewhere it would be got wrong.
-    var ladder: [ScaleStep] {
-        buildAnchors(basePortionG: basePortionG, servingUnits: servingUnits, servingMode: servingMode)
+    func ladder(lang: String) -> [ScaleStep] {
+        buildAnchors(basePortionG: basePortionG, servingUnits: servingUnits, servingMode: servingMode, lang: lang)
     }
 
-    var anchors: [QuantityAnchor] {
-        ladder.map {
-            QuantityAnchor(label: stepLabel($0), grams: stepRawWeight($0, basePortionG: basePortionG))
+    func anchors(lang: String) -> [QuantityAnchor] {
+        ladder(lang: lang).map {
+            QuantityAnchor(label: stepLabel($0, lang: lang), grams: stepRawWeight($0, basePortionG: basePortionG))
         }
     }
 
-    /// The collapsed summary — "≈ 1,3 portion" and the weight beneath it.
-    var summary: QuantityDescription {
-        describeQuantity(
+    /// The collapsed summary — "≈ 1,3 portion"/"≈ 1.3 servings" and the weight beneath it.
+    func summary(lang: String) -> QuantityDescription {
+        let itemUnit = servingUnits.first(where: { $0.isItem })
+        return describeQuantity(
             currentG: quantity,
-            anchors: anchors,
+            anchors: anchors(lang: lang),
             context: QuantityContext(
                 servingMode: servingMode,
                 // The item unit's weight and label, when there is one. `describeQuantity` keys its item
                 // branch on *these* rather than on servingMode — the corpus has a case with no
                 // servingMode that still takes that branch — so passing them is what makes "≈ 2
                 // carottes" possible at all.
-                itemUnitG: servingUnits.first(where: { $0.isItem })?.grams,
-                itemLabel: servingUnits.first(where: { $0.isItem })?.labelFr,
+                itemUnitG: itemUnit?.grams,
+                itemLabel: itemUnit.flatMap { pickLocalized($0.labels, preferring: lang) },
                 portionG: basePortionG,
                 displayUnit: displayUnit
-            )
+            ),
+            lang: lang
         )
     }
 }
@@ -90,7 +109,8 @@ extension MealItem {
     /// convert it. The one consequence worth knowing — switching cooking method on an edited row will not
     /// auto-adjust the weight, since there is no yield factor to convert with.
     func asMealIngredient(id: String) -> MealIngredient {
-        MealIngredient(
+        if isQuickAdd, let energyKcal { return .quickAdd(kcal: energyKcal, id: id) }
+        return MealIngredient(
             id: id,
             label: label,
             ingredientId: ingredientId ?? id,
@@ -131,10 +151,12 @@ extension IngredientSuggestion {
     /// defaults the method to "grilled" — a visible, correctable guess rather than the retired generic
     /// "cuit (générique)" bucket, which is no longer a value this app ever produces.
     func asMealRow(id: String) -> MealIngredient {
-        if let row = buildMealIngredient(AddItem(suggestion: self), id: id) { return row }
+        if let row = buildMealIngredient(AddItem(suggestion: self), id: id) {
+            return row.lockedToRawIfIndustrial(isProduct: isProduct)
+        }
 
         let base = servingG ?? fallbackPortionG
-        return MealIngredient(
+        let fallback = MealIngredient(
             id: id,
             label: label,
             ingredientId: ingredientId,
@@ -153,6 +175,22 @@ extension IngredientSuggestion {
             imageUrl: imageUrl,
             servingMode: servingMode
         )
+        return fallback.lockedToRawIfIndustrial(isProduct: isProduct)
+    }
+}
+
+extension MealIngredient {
+
+    /// Locks a row to "raw" the moment it wraps an Open Food Facts product: the backend now always
+    /// analyses OFF items at their own values (source "off_direct", cookingMethod "raw") regardless of
+    /// what the client sends, so offering a cooking-method choice here would be a UI lie. Goes through
+    /// `applyMethodChange` rather than re-deriving the raw-weight math, so that conversion stays the
+    /// one place it is pinned. Idempotent for a row that is already raw.
+    func lockedToRawIfIndustrial(isProduct: Bool) -> MealIngredient {
+        guard isProduct else { return self }
+        var locked = applyMethodChange(self, to: "raw")
+        locked.isIndustrialProduct = true
+        return locked
     }
 }
 

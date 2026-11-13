@@ -8,30 +8,48 @@
 
   All four keys are declared explicitly, including the empty ones. An absent key and an empty array
   mean the same thing to Apple's tooling but not to a reader — "we collect nothing" and "nobody filled
-  this in" would otherwise be the same file — and this app genuinely collects nothing.
+  this in" would otherwise be the same file.
 
     NSPrivacyTracking            false  no tracking of any kind.
-    NSPrivacyTrackingDomains     empty  nothing to list. There are no third-party SDKs at all;
-                                        Package.swift declares no .package(url:) dependencies, so
-                                        there are no vendored manifests to reconcile with this one.
-    NSPrivacyCollectedDataTypes  empty  the food journal never leaves the device. It is a JSON file in
-                                        Application Support written by App/Model/Journal.swift, and the
-                                        only network calls are GET /ingredients/search and
-                                        POST /nutrition, which send a food name, a weight and a cooking
-                                        method — no identifier, no account, no device data.
-    NSPrivacyAccessedAPITypes    empty  see below.
+    NSPrivacyTrackingDomains     empty  nothing to list. The only third-party dependency is swift-sodium
+                                        (libsodium), used for the vault's cryptography. It makes no network
+                                        requests, collects nothing, and ships no manifest of its own.
 
-  On the last one, because an empty array here is a claim and not a default: the required-reason API
-  categories are file timestamp, system boot time, disk space, active keyboard and user defaults.
-  Journal.swift is the only file touching the filesystem and it uses exactly four calls —
-  FileManager.urls(for:in:), createDirectory, removeItem and moveItem. None of those is a
-  required-reason API: it never reads a creation or modification date, never inspects free space, and
-  UserDefaults appears nowhere in the target. Declaring a category anyway — C617.1 for timestamps, or
-  E174.1 for disk space — would be over-declaring, which misdescribes the app just as surely as
-  under-declaring does.
+    NSPrivacyCollectedDataTypes  three entries, all for OPTIONAL features:
 
-  Recheck this file if Journal.swift ever sorts by file date, reports free space, or if UserDefaults
-  arrives with a settings screen.
+      AudioData   The voice recording sent for analysis when the person uses voice capture. It is kept by
+                  the recognition service in memory only until it is processed (at most 48 hours), then
+                  discarded. Not linked to an identity, not used for tracking.
+      PhotosorVideos  The meal photo sent for analysis when the person photographs a meal (camera or
+                  library). Re-encoded on the phone first: no location or camera metadata, longest side
+                  1024 px. Same handling as the voice recording: kept in memory only until processed (at
+                  most 48 hours), then discarded. Not linked to an identity, not used for tracking.
+      UserID      The username of the cloud vault account, which voice capture requires. No email is
+                  asked for or stored. Linked (it is the account), not used for tracking.
+
+                  NOT declared: the vault records, which are the voice results AND the whole meal journal
+                  once a vault account is linked. They are encrypted on the phone and the server only ever
+                  holds ciphertext it cannot read, and the passphrase never leaves the device. Whether Apple
+                  counts that as "collected" (and as which category: the journal is food and health data)
+                  is for App Store Connect's questionnaire to settle, and is the first thing to recheck; the
+                  entries above are what the app transmits in a form the service can read.
+
+      Everything else stays on the device: the food journal is a JSON file in Application Support (plus,
+      with a vault account, its encrypted copy in the vault), and the nutrition requests (GET /ingredients/search, GET /ingredients/barcode, POST /nutrition) send a
+      food name, a barcode number, a weight and a cooking method, with no identifier.
+
+    NSPrivacyAccessedAPITypes    two required-reason categories, each used and nothing more:
+
+      UserDefaults    CA92.1  reads and writes the app's own preferences: language, the server addresses,
+                              and a marker telling a fresh install from a relaunch.
+      FileTimestamp   C617.1  RecognitionEntryStore reads the modification date of the voice recordings in
+                              the app's own container to delete audio older than its retention period.
+
+      Not declared, because not used: system boot time, disk space and active keyboard.
+
+  Recheck this file when a feature starts sending something new off the device, or when any API in the
+  required-reason list (file timestamp, boot time, disk space, keyboard, user defaults) is used somewhere
+  new. Over-declaring misdescribes the app just as under-declaring does.
 -->
 <plist version="1.0">
 <dict>
@@ -42,9 +60,63 @@
     <array/>
 
     <key>NSPrivacyCollectedDataTypes</key>
-    <array/>
+    <array>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeAudioData</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypePhotosorVideos</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeUserID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+    </array>
 
     <key>NSPrivacyAccessedAPITypes</key>
-    <array/>
+    <array>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

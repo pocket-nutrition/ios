@@ -13,13 +13,34 @@ import PocketNutritionCore
 /// named mismatch instead of taking the whole run down.
 enum ScaleStepDecoding {
 
+    static func localizedText(_ raw: [String: Any]) -> LocalizedText? {
+        guard let lang = raw["lang"] as? String, let text = raw["text"] as? String else { return nil }
+        return LocalizedText(lang: lang, text: text)
+    }
+
+    /// Tolerant of the same two shapes `ServingUnit.init(from:)` is — see that initializer's comment.
+    /// The pre-2.0.0 `build-anchors`/`shortcut-profile`/`step-label`/`step-raw-weight` suites still
+    /// carry `labelFr`/`labelEn`; the `-en` siblings added in 2.0.0 carry the generic `labels` array.
     static func servingUnit(_ raw: [String: Any]) -> ServingUnit? {
         guard let unit = raw["unit"] as? String,
-              let labelFr = raw["labelFr"] as? String,
               let volumeMl = VectorCorpus.double(raw["volumeMl"]),
               let grams = VectorCorpus.double(raw["grams"])
         else { return nil }
-        return ServingUnit(unit: unit, labelFr: labelFr, volumeMl: volumeMl, grams: grams)
+        let labels: [LocalizedText]
+        if let rawLabels = raw["labels"] as? [[String: Any]] {
+            let decoded = rawLabels.compactMap(localizedText)
+            guard decoded.count == rawLabels.count else { return nil }
+            labels = decoded
+        } else if let labelFr = raw["labelFr"] as? String {
+            var built = [LocalizedText(lang: "fr", text: labelFr)]
+            if let labelEn = raw["labelEn"] as? String {
+                built.append(LocalizedText(lang: "en", text: labelEn))
+            }
+            labels = built
+        } else {
+            return nil
+        }
+        return ServingUnit(unit: unit, labels: labels, volumeMl: volumeMl, grams: grams)
     }
 
     /// `emoji` is ABSENT rather than null for an unrecognised unit, so a missing key decodes to nil

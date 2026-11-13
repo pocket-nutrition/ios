@@ -23,6 +23,9 @@ struct BarcodeScanFlowView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var stage: Stage = .checking
+    /// The code the catalogue did not know, so it can be reported once with "Report this product".
+    @State private var notFoundCode: String?
+    @State private var isReportSent = false
 
     private enum Stage: Equatable {
         case checking
@@ -45,29 +48,29 @@ struct BarcodeScanFlowView: View {
 
             case .unavailable:
                 messageCard(
-                    title: Fr.scanUnavailableTitle,
-                    body: Fr.scanUnavailable,
-                    primaryTitle: Fr.aboutClose,
+                    title: Strings.active.scanUnavailableTitle,
+                    body: Strings.active.scanUnavailable,
+                    primaryTitle: Strings.active.aboutClose,
                     primaryAction: { dismiss() }
                 )
 
             case .explainer:
                 messageCard(
-                    title: Fr.scanExplainerTitle,
-                    body: Fr.scanExplainerBody,
-                    primaryTitle: Fr.scanExplainerContinue,
+                    title: Strings.active.scanExplainerTitle,
+                    body: Strings.active.scanExplainerBody,
+                    primaryTitle: Strings.active.scanExplainerContinue,
                     primaryAction: requestAccess,
-                    secondaryTitle: Fr.scanExplainerNotNow,
+                    secondaryTitle: Strings.active.scanExplainerNotNow,
                     secondaryAction: { dismiss() }
                 )
 
             case .deniedGoToSettings:
                 messageCard(
-                    title: Fr.scanSettingsTitle,
-                    body: Fr.scanSettingsBody,
-                    primaryTitle: Fr.scanSettingsOpenSettings,
+                    title: Strings.active.scanSettingsTitle,
+                    body: Strings.active.scanSettingsBody,
+                    primaryTitle: Strings.active.scanSettingsOpenSettings,
                     primaryAction: openSettings,
-                    secondaryTitle: Fr.searchCancel,
+                    secondaryTitle: Strings.active.searchCancel,
                     secondaryAction: { dismiss() }
                 )
 
@@ -79,7 +82,7 @@ struct BarcodeScanFlowView: View {
                 ZStack {
                     scannerLayer
                     if stage == .lookingUp {
-                        ProgressView(Fr.scanLookingUp)
+                        ProgressView(Strings.active.scanLookingUp)
                             .tint(.white)
                             .foregroundStyle(.white)
                             .padding(20)
@@ -90,21 +93,23 @@ struct BarcodeScanFlowView: View {
 
             case .notFound:
                 messageCard(
-                    title: Fr.scanNotFoundTitle,
-                    body: Fr.scanNotFound,
-                    primaryTitle: Fr.retry,
+                    title: Strings.active.scanNotFoundTitle,
+                    body: Strings.active.scanNotFound,
+                    primaryTitle: Strings.active.retry,
                     primaryAction: { stage = .scanning },
-                    secondaryTitle: Fr.searchCancel,
-                    secondaryAction: { dismiss() }
+                    secondaryTitle: Strings.active.searchCancel,
+                    secondaryAction: { dismiss() },
+                    tertiaryTitle: notFoundCode == nil ? nil : (isReportSent ? Strings.active.scanReportSent : Strings.active.scanReport),
+                    tertiaryAction: isReportSent ? nil : { reportMissing() }
                 )
 
             case .failed(let message):
                 messageCard(
-                    title: Fr.scanErrorTitle,
-                    body: Fr.error(message),
-                    primaryTitle: Fr.retry,
+                    title: Strings.active.scanErrorTitle,
+                    body: Strings.active.error(message),
+                    primaryTitle: Strings.active.retry,
                     primaryAction: { stage = .scanning },
-                    secondaryTitle: Fr.searchCancel,
+                    secondaryTitle: Strings.active.searchCancel,
                     secondaryAction: { dismiss() }
                 )
             }
@@ -178,16 +183,31 @@ struct BarcodeScanFlowView: View {
             return
         }
         stage = .lookingUp
+        let lang = LanguageSettings.shared.effective
         Task {
             do {
-                if let suggestion = try await PocketNutritionApi.shared.lookupBarcode(payload) {
+                if let suggestion = try await PocketNutritionApi.shared.lookupBarcode(payload, lang: lang) {
                     onFound(suggestion)
                 } else {
+                    if notFoundCode != payload { isReportSent = false }
+                    notFoundCode = payload
                     stage = .notFound
                 }
             } catch {
                 stage = .failed((error as? ApiError)?.errorDescription ?? "\(error)")
             }
+        }
+    }
+
+    /// Tells the catalogue team this barcode is missing, through the anonymous feedback endpoint. Only
+    /// the code is sent; adding the product properly is Knowledge's job, not a client-side guess.
+    private func reportMissing() {
+        guard let code = notFoundCode else { return }
+        isReportSent = true
+        Task {
+            try? await PocketNutritionApi.shared.submitFeedback(FeedbackRequest(
+                name: "EAN \(code)", corrections: [], comment: "Barcode not found in the catalogue: \(code)",
+                cookingMethod: nil, measuredState: nil, source: "barcode"))
         }
     }
 
@@ -200,7 +220,9 @@ struct BarcodeScanFlowView: View {
         primaryTitle: String,
         primaryAction: @escaping () -> Void,
         secondaryTitle: String? = nil,
-        secondaryAction: (() -> Void)? = nil
+        secondaryAction: (() -> Void)? = nil,
+        tertiaryTitle: String? = nil,
+        tertiaryAction: (() -> Void)? = nil
     ) -> some View {
         VStack(spacing: 16) {
             Image(systemName: "barcode.viewfinder")
@@ -222,6 +244,13 @@ struct BarcodeScanFlowView: View {
                 Button(secondaryTitle, action: secondaryAction)
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(PnColor.inkSoft)
+            }
+
+            if let tertiaryTitle {
+                Button(tertiaryTitle) { tertiaryAction?() }
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(tertiaryAction == nil ? PnColor.inkSoft : PnColor.brandLeafDeep)
+                    .disabled(tertiaryAction == nil)
             }
         }
         .padding(24)

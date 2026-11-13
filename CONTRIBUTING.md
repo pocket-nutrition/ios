@@ -5,7 +5,7 @@ Thanks for looking at this. Two things before anything else:
 - Read the **Licence** section of `README.md`. This repo is MPL-2.0, deliberately, and there are hard
   rules about what may and may not be copied in from where.
 - Read `AGENTS.md`. It has the toolchain traps that have already cost time once each — rounding,
-  the vendored `contract/` tree, and why the app target isn't gated by CI.
+  the vendored `contract/` tree, and why CI is split between a Linux core job and a macOS app job.
 
 ## Prerequisites
 
@@ -117,9 +117,9 @@ independently — the two clients stay behaviourally identical without sharing r
 4. Commit with a clear, imperative message (`fix: correct yield factor for grilled chicken`, not
    `updates`). Keep commits focused — one logical change per commit.
 5. Open a PR against `main` describing what changed and why. Link any related issue.
-6. CI must be green (the `swift test` suite on Linux). CI cannot build or test the app target — SwiftUI
-   and the iOS SDK are Apple-only and there is deliberately no macOS runner — so app-target changes are
-   verified by a human, on a Mac, before merge.
+6. CI must be green: the contract pin check, the `swift test` suite on Linux, and the unsigned app build
+   on macOS. CI builds the app but does not run UI tests, so app-target changes still deserve a look in
+   the simulator before merge.
 
 ## Reporting issues
 
@@ -127,3 +127,15 @@ Use the GitHub issue templates under `.github/ISSUE_TEMPLATE/`. For a bug, inclu
 iOS version, and app version/build — the templates prompt for these. For anything that looks like it
 might be a security issue (signing material, leaked credentials, an API key in a log), do not open a
 public issue — contact the maintainer directly instead.
+
+## CI and releases
+
+- Every pull request runs `.github/workflows/ci.yml`. The `ci-success` check must be green before a pull
+  request can be merged, the branch must be up to date with `main`, and pull requests are squash-merged
+  so history stays linear.
+- If you contribute from a fork, the workflow waits for a maintainer to approve it. It runs with a
+  read-only token and no secrets.
+- Every commit merged to `main` is released automatically with a CalVer version, `vYYYY.M.N`: the year, the
+  month, then a counter that restarts at 1 each month (for example `v2026.11.1`). You never pick a version
+  number or edit a changelog; release notes are generated from the merged pull requests.
+- A release is a tag and release notes only: CI builds and tests the app but produces no installable binary.

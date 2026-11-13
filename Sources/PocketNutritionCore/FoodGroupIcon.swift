@@ -9,7 +9,7 @@
 /// from data already on the wire.
 ///
 /// The vocabulary is closed: 21 values, enumerated in
-/// `pocket-nutrition-knowledge/schemas/ingredient.schema.json`. Three are deliberately unmapped and
+/// `pocket-nutrition/knowledge/schemas/ingredient.schema.json`. Three are deliberately unmapped and
 /// return nil rather than a poor guess, following the same rule as `servingUnitEmoji` — a wrong icon is
 /// worse than none, and nil falls back to the neutral thumbnail placeholder the row already has for a
 /// missing photo. `sauce` is the notable one: it is the second-largest group in the catalogue, and no

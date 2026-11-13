@@ -32,7 +32,7 @@ struct FoodItemRequest: Encodable, Sendable {
 ///
 /// Only the fields the results screen renders are declared. Adding another nutrient is a one-line
 /// change; carrying all thirty unused would obscure which ones the product actually shows.
-struct NutritionalProfile: Decodable, Sendable {
+struct NutritionalProfile: Decodable, Sendable, NutritionAnalysedItem {
     let name: String
     let quantity: Double
     let unit: String
@@ -44,6 +44,61 @@ struct NutritionalProfile: Decodable, Sendable {
     let carbohydratesG: Double
     let fiberG: Double?
     let sugarsG: Double?
+    /// Every nutrient of the response, including the ones not shown yet, so a saved meal keeps them.
+    let nutrients: NutrientTotals
+    /// False when the server could not compute the item. Its macros are then placeholder zeros and
+    /// count in no total — see `NutritionAvailability`. A response without the field counts as true.
+    let isAvailable: Bool
+
+    init(
+        name: String, quantity: Double, unit: String, cookingMethod: String, measuredState: String,
+        energyKcal: Double, proteinG: Double, fatG: Double, carbohydratesG: Double, fiberG: Double?,
+        sugarsG: Double?, nutrients: NutrientTotals, isAvailable: Bool = true
+    ) {
+        self.name = name
+        self.quantity = quantity
+        self.unit = unit
+        self.cookingMethod = cookingMethod
+        self.measuredState = measuredState
+        self.energyKcal = energyKcal
+        self.proteinG = proteinG
+        self.fatG = fatG
+        self.carbohydratesG = carbohydratesG
+        self.fiberG = fiberG
+        self.sugarsG = sugarsG
+        self.nutrients = nutrients
+        self.isAvailable = isAvailable
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, quantity, unit, cookingMethod, measuredState, energyKcal, proteinG, fatG, carbohydratesG
+        case fiberG, sugarsG
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            name: try c.decode(String.self, forKey: .name),
+            quantity: try c.decode(Double.self, forKey: .quantity),
+            unit: try c.decode(String.self, forKey: .unit),
+            cookingMethod: try c.decode(String.self, forKey: .cookingMethod),
+            measuredState: try c.decode(String.self, forKey: .measuredState),
+            energyKcal: try c.decode(Double.self, forKey: .energyKcal),
+            proteinG: try c.decode(Double.self, forKey: .proteinG),
+            fatG: try c.decode(Double.self, forKey: .fatG),
+            carbohydratesG: try c.decode(Double.self, forKey: .carbohydratesG),
+            fiberG: try c.decodeIfPresent(Double.self, forKey: .fiberG),
+            sugarsG: try c.decodeIfPresent(Double.self, forKey: .sugarsG),
+            nutrients: try NutrientTotals(profileFrom: decoder),
+            isAvailable: try NutritionAvailability(from: decoder).available)
+    }
+}
+/// `GET /reference-intakes` response. The rows decode into Core's `ReferenceRow`, which keeps only the fields
+/// the calculation reads; the others (`raw`, `note`, `ageLabel`…) decode away.
+struct ReferenceIntakesResponse: Codable, Sendable {
+    let source: String
+    let sourceUrl: String
+    let values: [ReferenceRow]
 }
 
 /// One field of an ingredient a user believes is wrong, plus the corrected value if they typed one.
@@ -84,13 +139,26 @@ struct ReferenceNutrition: Decodable, Sendable {
 /// `GET /ingredients/{id}` response — the knowledge-base detail behind one ingredient, fetched only to
 /// enrich the feedback form's current-value hints for the categories `MealIngredient` cannot answer on
 /// its own (nutrition, identity — see `FeedbackCurrentValueHint`). Declares only what the form reads;
-/// `aliasesFr`/`aliasesEn`/`servingUnits`/`referenceWeightG`/etc. the server also sends decode away
-/// harmlessly, same as every other type in this file that only names a subset of its response schema.
+/// `aliases`/`servingUnits`/`referenceWeightG`/etc. the server also sends decode away harmlessly, same
+/// as every other type in this file that only names a subset of its response schema.
+///
+/// `names` replaced the old fixed `nameFr`/`nameEn` fields in contract 2.0.0 — a generic
+/// `[LocalizedText]` rather than a field pair, so a third language never needs another field added
+/// here. Resolve a specific language with `pickLocalized(names, preferring:)`.
 struct IngredientDetail: Decodable, Sendable {
-    let nameFr: String?
-    let nameEn: String?
+    let names: [LocalizedText]
     let foodGroup: String?
     let referenceNutrition: ReferenceNutrition?
+
+    // Declared for the voice-capture import, which has to turn a bare ingredient id into a meal row and
+    // `GET /ingredients/{id}` is the only by-id lookup there is. All optional: a response that omits
+    // them still decodes, exactly as before for the feedback form.
+    let referenceWeightG: Double?
+    let displayUnit: String?
+    let servingUnits: [ServingUnit]?
+    let canEatRaw: Bool?
+    let canEatCooked: Bool?
+    let typicalState: String?
 }
 
 /// Failures a caller can act on differently, rather than one opaque error.
@@ -122,9 +190,15 @@ actor PocketNutritionApi {
 
     static let shared = PocketNutritionApi()
 
-    /// The public API. No staging host and no build-time switch: there is one deployment, and a URL
-    /// that can be pointed elsewhere invites shipping a build pointed at the wrong place.
-    private let baseURL = URL(string: "https://api.pocketnutrition.org")!
+    /// The official Pocket Nutrition API, used unless a contributor points the app at their own
+    /// server via `ApiSettings` (see `AboutView`'s "Serveur" section). No build-time switch: the
+    /// override is entirely a runtime setting in the shipped app, which is what makes building a
+    /// separate staging-pointed archive unnecessary.
+    static let defaultBaseURL = URL(string: "https://api.pocketnutrition.org")!
+
+    /// What every request actually goes to. Computed rather than stored — a change made from
+    /// `AboutView` must take effect on the very next request, not after the app relaunches.
+    private var baseURL: URL { ApiSettings.baseURL }
 
     private let session: URLSession
     private let decoder = JSONDecoder()
@@ -160,7 +234,12 @@ actor PocketNutritionApi {
 
     /// `GET /ingredients/search`. A blank query returns an empty result without calling the server: the
     /// field fires as the user types, and `q` is required by the spec.
-    func search(_ query: String, limit: Int = 12) async throws -> SearchResponse {
+    ///
+    /// `lang` is a plain `String` parameter rather than a read of `LanguageSettings.shared` from
+    /// inside this actor on purpose — that would cross an isolation boundary to reach a non-`Sendable`
+    /// class. The caller (a View, on the main actor) reads the active language itself and passes it
+    /// in, the same way every core function in `PocketNutritionCore` takes `lang` explicitly.
+    func search(_ query: String, lang: String, limit: Int = 12) async throws -> SearchResponse {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return SearchResponse(rows: [], segmentCount: 1) }
 
@@ -170,7 +249,7 @@ actor PocketNutritionApi {
         )!
         components.queryItems = [
             URLQueryItem(name: "q", value: trimmed),
-            URLQueryItem(name: "lang", value: "fr"),
+            URLQueryItem(name: "lang", value: lang),
             URLQueryItem(name: "limit", value: String(limit)),
         ]
         let (rows, headers): ([IngredientSuggestion], HTTPURLResponse) =
@@ -220,9 +299,13 @@ actor PocketNutritionApi {
     /// into `IngredientSuggestion`: the response schema (`IngredientSuggestionWithNutrition`) is that
     /// same field set plus an unused `nutrition` field, which decodes away harmlessly like every other
     /// field this type does not declare.
-    func lookupBarcode(_ ean13: String) async throws -> IngredientSuggestion? {
-        let url = baseURL.appendingPathComponent("ingredients/barcode").appendingPathComponent(ean13)
-        return try await sendAllowingNotFound(URLRequest(url: url))
+    func lookupBarcode(_ ean13: String, lang: String) async throws -> IngredientSuggestion? {
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("ingredients/barcode").appendingPathComponent(ean13),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [URLQueryItem(name: "lang", value: lang)]
+        return try await sendAllowingNotFound(URLRequest(url: components.url!))
     }
 
     /// `GET /ingredients/{id}`. `nil` means the id is not in the index — the same "expected outcome,
@@ -230,8 +313,21 @@ actor PocketNutritionApi {
     /// "no extra hints available" rather than surfacing an error, since this only enriches a form that
     /// works without it.
     func ingredientDetail(_ id: String) async throws -> IngredientDetail? {
-        let url = baseURL.appendingPathComponent("ingredients").appendingPathComponent(id)
+        // `appendingPathComponent` does not encode "/", so an id from outside could climb the path.
+        // Encoded as ONE segment here, with "." and ".." refused; the voice import applies the stricter
+        // `isValidIngredientId` before it ever gets this far.
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        guard !id.isEmpty, id != ".", id != "..",
+              let segment = id.addingPercentEncoding(withAllowedCharacters: allowed),
+              let url = URL(string: baseURL.appendingPathComponent("ingredients").absoluteString + "/" + segment)
+        else { throw ApiError.malformedResponse }
         return try await sendAllowingNotFound(URLRequest(url: url))
+    }
+
+    /// `GET /reference-intakes`: the full EFSA reference table, the same for everyone. Takes no parameter on
+    /// purpose — the profile (age, weight, pregnancy) never leaves the phone; the rows are selected locally.
+    func referenceIntakes() async throws -> ReferenceIntakesResponse {
+        try await send(URLRequest(url: baseURL.appendingPathComponent("reference-intakes")))
     }
 
     private func send<T: Decodable>(_ request: URLRequest) async throws -> T {

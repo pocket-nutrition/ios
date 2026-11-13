@@ -2,8 +2,10 @@
 
 import SwiftUI
 import PocketNutritionCore
+import PocketNutritionVault
 
-/// Home screen: the meals kept on this device, newest day first.
+/// Home screen: the meals kept on this device, newest day first, with the dictations and meal photos that
+/// are not meals yet shown in their day as outlined "meal in progress" rows (see `JournalCaptureRow`).
 ///
 /// This screen has no counterpart in the sandbox — the prototype persists nothing. It exists because
 /// a food diary that forgets is not a diary, and it is the reason the app needs its own privacy copy
@@ -13,38 +15,65 @@ struct JournalView: View {
     @Environment(JournalStore.self) private var store
     @State private var composerTarget: ComposerTarget?
     @State private var isShowingAbout = false
+    @State private var isShowingSettings = false
+    @Environment(RecognitionEntryStore.self) private var recognitionStore
+    @Environment(RecognitionCoordinator.self) private var recognition
+    /// A ready capture whose result needs a look before it can become a meal (nothing usable, or a lookup
+    /// that failed and may be retried).
+    @State private var reviewCapture: RecognitionEntry?
+    /// Set while a ready capture's ingredients are being looked up, so a second tap does nothing.
+    @State private var openingCaptureId: String?
+    @Environment(MealShortcutsStore.self) private var shortcuts
+    /// The meal being saved as a dish, from its long-press menu.
+    @State private var dishSource: SavedMeal?
+    @State private var isShowingVault = false
+    /// Cached: the Keychain is read when the screen appears and when the vault sheet closes, never in `body`.
+    @State private var isVaultLinked = VaultInbox.live() != nil
+    @AppStorage("vaultCardDismissed") private var isVaultCardDismissed = false
+    @Environment(TargetsStore.self) private var targets
+    @Environment(ReferenceIntakesStore.self) private var reference
+    @AppStorage(TargetsFeature.defaultsKey) private var isTargetsEnabled = TargetsFeature.defaultEnabled
+    @State private var detailDay: TargetsDay?
+    @State private var isShowingQuestionnaire = false
+    @State private var isLoggingWeight = false
 
     var body: some View {
         NavigationStack {
             Group {
-                if store.meals.isEmpty {
+                if store.meals.isEmpty && recognitionStore.entries.isEmpty {
                     emptyState
                 } else {
                     mealList
                 }
             }
             .background(PnColor.surfacePaper)
-            .navigationTitle(Fr.journalTitle)
+            .navigationTitle(Strings.active.journalTitle)
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
                         composerTarget = .new
                     } label: {
-                        Label(Fr.journalAdd, systemImage: "plus")
+                        Label(Strings.active.journalAdd, systemImage: "plus")
                     }
                 }
-                // A menu rather than a direct button, even though it holds one entry today: the shape
-                // a second entry (settings, export, whatever comes next) can grow into without a
-                // redesign, at the cost of one extra tap for the entry it actually holds right now.
+                // A real menu, not a single-purpose button: About (licence/attribution/privacy) and
+                // Settings (language, server override) are two distinct destinations, not one screen
+                // wearing two hats — see AboutView's and SettingsView's own doc comments for why they
+                // were split.
                 ToolbarItem(placement: .topBarLeading) {
                     Menu {
                         Button {
                             isShowingAbout = true
                         } label: {
-                            Text("Informations de licence")
+                            Label(Strings.active.aboutTitle, systemImage: "info.circle")
+                        }
+                        Button {
+                            isShowingSettings = true
+                        } label: {
+                            Label(Strings.active.settingsTitle, systemImage: "gearshape")
                         }
                     } label: {
-                        Image(systemName: "gearshape")
+                        Image(systemName: "ellipsis.circle")
                     }
                     .accessibilityLabel("Menu")
                 }
@@ -55,27 +84,75 @@ struct JournalView: View {
                     MealBuilderView()
                 case .edit(let meal):
                     MealBuilderView(editingMeal: meal)
+                case .capture(let entry, let rows):
+                    MealBuilderView(initialItems: rows, sourceCapture: entry)
+                case .slot(let slot):
+                    MealBuilderView(slot: slot)
                 }
             }
             .sheet(isPresented: $isShowingAbout) {
                 AboutView()
             }
+            .sheet(item: $dishSource) { meal in
+                SaveDishSheet(items: meal.items) { name, servings in
+                    shortcuts.saveDish(name: name, servings: servings, items: meal.items)
+                }
+            }
+            .sheet(item: $reviewCapture) { entry in
+                NavigationStack {
+                    VoiceReviewView(localId: entry.localId) { rows in
+                        reviewCapture = nil
+                        // After the sheet is gone: SwiftUI will not present over a sheet that is leaving.
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(450))
+                            composerTarget = .capture(entry, rows)
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(Strings.active.aboutClose) { reviewCapture = nil }
+                        }
+                    }
+                }
+            }
+            // Captures in the journal move on by themselves: sending, then following each ticket.
+            .onAppear {
+                recognition.start()
+                recognition.refreshProcessingOnce()
+            }
+            .sheet(isPresented: $isShowingSettings, onDismiss: { isVaultLinked = VaultInbox.live() != nil }) {
+                SettingsView()
+            }
+            .sheet(isPresented: $isShowingVault, onDismiss: { isVaultLinked = VaultInbox.live() != nil }) {
+                VaultView()
+            }
+            .sheet(item: $detailDay) { day in
+                DayDetailView(day: day.id, reader: targetsReader)
+            }
+            .sheet(isPresented: $isShowingQuestionnaire) { QuestionnaireView() }
+            .sheet(isPresented: $isLoggingWeight) { WeightEntrySheet() }
         }
     }
 
     private var emptyState: some View {
         VStack(spacing: 16) {
             Text("🥗").font(.system(size: 52))
-            Text(Fr.journalEmpty)
+            Text(Strings.active.journalEmpty)
                 .font(.subheadline)
                 .foregroundStyle(PnColor.inkSoft)
                 .multilineTextAlignment(.center)
-            Button(Fr.journalAdd) { composerTarget = .new }
+            Button(Strings.active.journalAdd) { composerTarget = .new }
                 .buttonStyle(PrimaryButtonStyle())
                 .padding(.top, 4)
+            if isTargetsEnabled && !targets.isConfigured {
+                Button(Strings.active.targetsSetMine) { isShowingQuestionnaire = true }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(PnColor.brandLeafDeep)
+                    .accessibilityIdentifier("set-my-targets")
+            }
             // Shown on the empty state rather than buried in a settings screen: the one moment the
             // user is deciding whether to trust the app with a diary is before they start one.
-            Text(Fr.journalPrivacy)
+            Text(Strings.active.journalPrivacy)
                 .font(.caption)
                 .foregroundStyle(PnColor.inkSoft)
                 .multilineTextAlignment(.center)
@@ -85,26 +162,62 @@ struct JournalView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// Offered once the person has a first meal, which is when a vault starts to mean something. It can be
+    /// dismissed for good; the vault stays reachable from Settings and from the microphone.
+    private var vaultCard: some View {
+        let t = Strings.active
+        return VStack(alignment: .leading, spacing: 8) {
+            Label(t.journalVaultCardTitle, systemImage: "lock.shield")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PnColor.brandLeafDeep)
+            Text(t.journalVaultCardBody)
+                .font(.footnote)
+                .foregroundStyle(PnColor.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button(t.journalVaultCardAction) { isShowingVault = true }
+                    .buttonStyle(PrimaryButtonStyle())
+                Button(t.journalVaultCardLater) { isVaultCardDismissed = true }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(PnColor.inkSoft)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .pnCard()
+    }
+
     private var mealList: some View {
         List {
-            ForEach(store.mealsByDay, id: \.day) { group in
+            if !isVaultLinked && !isVaultCardDismissed {
+                vaultCard
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+            }
+            if recognitionStore.isBlocked || !recognitionStore.unsavedClips.isEmpty {
+                storageBanner
+                    .listRowBackground(PnColor.surfaceCream)
+            }
+            ForEach(days, id: \.day) { day in
+                let isToday = Calendar.current.isDateInToday(day.day)
                 Section {
-                    ForEach(group.meals) { meal in
-                        Button {
-                            composerTarget = .edit(meal)
-                        } label: {
-                            MealRow(meal: meal)
-                        }
-                        .buttonStyle(.plain)
-                        .listRowBackground(PnColor.surfaceCard)
+                    if isTargetsEnabled {
+                        targetsRow(for: day.day, isToday: isToday)
                     }
-                    .onDelete { offsets in
-                        offsets.map { group.meals[$0] }.forEach(store.delete)
+                    ForEach(groupBySlot(
+                        day, slotOf: \.effectiveSlot, dateOf: \.savedAt, includeEmptyMainSlots: isToday
+                    ), id: \.slot) { group in
+                        slotHeader(group.slot)
+                        if group.items.isEmpty {
+                            emptySlotRow(group.slot)
+                        }
+                        ForEach(group.items, id: \.id) { item in
+                            row(item)
+                        }
+                        .onDelete { offsets in offsets.map { group.items[$0] }.forEach(delete) }
                     }
                 } header: {
-                    Text(Self.dayFormatter.string(from: group.day))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(PnColor.inkSoft)
+                    dayHeader(day)
                 }
             }
         }
@@ -112,15 +225,249 @@ struct JournalView: View {
         .scrollContentBackground(.hidden)
     }
 
+    private var targetsReader: TargetsReader {
+        TargetsReader(journal: store, targets: targets, reference: reference)
+    }
+
+    /// The day's watch-list rings (spec 05 §6), tappable for the day detail. Days with no target keep their
+    /// totals only, exactly as before. Today also offers "Set my targets" (until something is set up) and
+    /// "Log weight".
+    @ViewBuilder
+    private func targetsRow(for date: Date, isToday: Bool) -> some View {
+        let day = localDay(date)
+        let outcome = targetsReader.outcome(on: day)
+        let t = Strings.active
+        if outcome != .none || isToday {
+            VStack(alignment: .leading, spacing: 10) {
+                if outcome == .needsTable {
+                    Text(t.targetsNeedConnection).font(.caption).foregroundStyle(PnColor.inkSoft)
+                } else if outcome != .none {
+                    Button {
+                        detailDay = TargetsDay(id: day)
+                    } label: {
+                        DayRingsRow(day: day, reader: targetsReader, keys: targets.watchList.keys)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("day-rings-\(day)")
+                }
+                if isToday && !targets.isConfigured {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(t.targetsSetMine, systemImage: "target")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(PnColor.brandLeafDeep)
+                        Text(t.targetsSetMineBody).font(.footnote).foregroundStyle(PnColor.inkSoft)
+                        Button(t.targetsSetMine) { isShowingQuestionnaire = true }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .accessibilityIdentifier("set-my-targets")
+                    }
+                }
+                if isToday && targets.isConfigured {
+                    Button {
+                        isLoggingWeight = true
+                    } label: {
+                        Label(t.weightLog, systemImage: "scalemass")
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(PnColor.brandLeafDeep)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("log-weight")
+                }
+            }
+            .padding(.vertical, 6)
+            .listRowBackground(PnColor.surfaceCard)
+            .task { await reference.refreshIfStale() }
+        }
+    }
+
+    private var timeline: [JournalTimelineDay<SavedMeal>] {
+        journalTimeline(meals: store.meals, dateOf: \.savedAt, captures: recognitionStore.entries)
+    }
+
+    /// The timeline, with today always present (even before anything is logged) so its empty meals
+    /// can be offered.
+    private var days: [JournalTimelineDay<SavedMeal>] {
+        let all = timeline
+        if let first = all.first, Calendar.current.isDateInToday(first.day) { return all }
+        return [JournalTimelineDay(day: Calendar.current.startOfDay(for: Date()), items: [])] + all
+    }
+
+    private func dayHeader(_ day: JournalTimelineDay<SavedMeal>) -> some View {
+        let kcal = day.items.reduce(0.0) { sum, item in
+            if case .meal(let meal) = item { return sum + meal.totals.energyKcal }
+            return sum
+        }
+        return HStack {
+            Text(Self.dayFormatter(lang: LanguageSettings.shared.effective).string(from: day.day))
+            Spacer()
+            if kcal > 0 { Text("\(roundHalfUp(kcal)) kcal") }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(PnColor.inkSoft)
+    }
+
+    private func slotHeader(_ slot: MealSlot) -> some View {
+        Text(Strings.active.mealSlotName(slot).uppercased())
+            .font(.caption2.weight(.semibold))
+            .tracking(0.6)
+            .foregroundStyle(PnColor.inkSoft)
+            .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 2, trailing: 16))
+            .listRowSeparator(.hidden)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    /// Today's main meal with nothing logged: one tap to compose it, and one tap to repeat yesterday's.
+    private func emptySlotRow(_ slot: MealSlot) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                composerTarget = .slot(slot)
+            } label: {
+                // The whole row left of the repeat button is the tap target, not just the label.
+                Label(Strings.active.mealSlotName(slot), systemImage: "plus")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(PnColor.brandLeafDeep)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            if let previous = yesterdaysMeal(in: slot) {
+                Button {
+                    repeatMeal(previous, in: slot)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(Strings.active.journalSameAsYesterday(previous.items.map(\.label).joined(separator: " · ")))
+                            .lineLimit(1)
+                        Image(systemName: "arrow.counterclockwise")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(PnColor.inkSoft)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(Strings.active.journalRepeatYesterdayA11y(Strings.active.mealSlotName(slot)))
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.clear.pnPendingCard(cornerRadius: 10).padding(.horizontal, 2).padding(.vertical, 2))
+    }
+
+    /// The latest meal eaten in this slot yesterday, if any.
+    private func yesterdaysMeal(in slot: MealSlot) -> SavedMeal? {
+        guard let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) else { return nil }
+        return store.meals
+            .filter { Calendar.current.isDate($0.savedAt, inSameDayAs: yesterday) && $0.effectiveSlot == slot }
+            .max { $0.savedAt < $1.savedAt }
+    }
+
+    /// Logs the same meal today, in the same slot: now if this is the current part of the day, else at the
+    /// slot's usual time. Same items and quantities, so the same nutrition.
+    private func repeatMeal(_ meal: SavedMeal, in slot: MealSlot) {
+        let now = Date()
+        let date = mealSlot(for: now) == slot ? now : defaultDate(for: slot, on: now)
+        let items = meal.items.map { item -> MealItem in
+            var copy = item
+            copy.id = UUID()
+            return copy
+        }
+        store.save(items: items, totals: meal.totals, at: date, slot: slot, nutrients: meal.nutrients)
+    }
+
+    @ViewBuilder
+    private func row(_ item: JournalTimelineItem<SavedMeal>) -> some View {
+        switch item {
+        case .meal(let meal):
+            Button {
+                composerTarget = .edit(meal)
+            } label: {
+                MealRow(meal: meal)
+            }
+            .buttonStyle(.plain)
+            .listRowBackground(PnColor.surfaceCard)
+            .contextMenu {
+                Button {
+                    repeatMeal(meal, in: mealSlot(for: Date()))
+                } label: {
+                    Label(Strings.active.logAgainNow, systemImage: "arrow.counterclockwise")
+                }
+                Button {
+                    dishSource = meal
+                } label: {
+                    Label(Strings.active.saveAsDish, systemImage: "square.and.arrow.down")
+                }
+                .disabled(!meal.items.contains { !$0.isQuickAdd })
+            }
+        case .capture(let entry):
+            Button {
+                open(entry)
+            } label: {
+                JournalCaptureRow(entry: entry, isOffline: recognition.isOffline)
+                    .opacity(openingCaptureId == entry.localId ? 0.5 : 1)
+            }
+            .buttonStyle(.plain)
+            .disabled(openingCaptureId != nil)
+            .listRowBackground(
+                Color.clear.pnPendingCard(cornerRadius: 10).padding(.horizontal, 2).padding(.vertical, 2)
+            )
+        }
+    }
+
+    private func delete(_ item: JournalTimelineItem<SavedMeal>) {
+        switch item {
+        case .meal(let meal): store.delete(meal)
+        case .capture(let entry): recognition.delete(entry.localId)
+        }
+    }
+
+    /// What a tap on a capture does, by state. A ready one goes straight to the meal builder with its best
+    /// matches, editable; only a result that needs a look (nothing usable, a lookup to retry) opens the review.
+    private func open(_ entry: RecognitionEntry) {
+        switch entry.state {
+        case .pendingUpload, .needsRetry:
+            recognition.sendNow(entry.localId)
+        case .ready:
+            guard let result = entry.result else { return }
+            openingCaptureId = entry.localId
+            Task {
+                let selections = result.items.map { ImportSelection(item: $0, candidate: $0.candidates.first) }
+                let outcome = await RecognitionImporter.resolve(selections, lang: LanguageSettings.shared.effective)
+                openingCaptureId = nil
+                if !outcome.rows.isEmpty, canDiscardAfterImport(skips: outcome.skipped.map(\.kind)) {
+                    composerTarget = .capture(entry, outcome.rows)
+                } else {
+                    reviewCapture = entry
+                }
+            }
+        case .processing, .unrecoverable:
+            break
+        }
+    }
+
+    /// Recordings or photos that could not be stored: never hidden behind an empty-looking journal.
+    private var storageBanner: some View {
+        HStack(spacing: 12) {
+            Text(Strings.active.voiceStorageUnavailable).font(.footnote).foregroundStyle(PnColor.inkDefault)
+            Spacer(minLength: 0)
+            Button(Strings.active.retry) {
+                recognitionStore.retryUnsavedClips().forEach { recognition.track($0.localId) }
+                recognition.start()
+            }
+            .font(.footnote.weight(.semibold))
+        }
+    }
+
     /// A date formatter *is* the right tool here, unlike for numbers. The corpus pins number rendering
     /// because a thousands separator changes the value a user reads; a date header has no such
-    /// contract and the platform's French formatting is what a French user expects.
-    private static let dayFormatter: DateFormatter = {
+    /// contract and the platform's own formatting for the active language is what a user expects.
+    ///
+    /// A function, not a `static let`, because the active language can change at runtime — a cached
+    /// formatter built once at first access would keep rendering in whichever language was active
+    /// then.
+    private static func dayFormatter(lang: String) -> DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "fr_FR")
+        formatter.locale = Locale(identifier: lang == "en" ? "en_US" : "fr_FR")
         formatter.setLocalizedDateFormatFromTemplate("EEEE d MMMM")
         return formatter
-    }()
+    }
 }
 
 /// What the meal builder's `fullScreenCover` is showing: a blank compose, or an existing entry to edit.
@@ -130,16 +477,39 @@ struct JournalView: View {
 private enum ComposerTarget: Identifiable {
     case new
     case edit(SavedMeal)
+    /// A dictation or photo made into a new meal: its rows pre-fill the builder, which dates the meal at
+    /// the capture and deletes the capture once saved.
+    case capture(RecognitionEntry, [MealIngredient])
+    /// "+ Breakfast" in today's journal: a new meal already filed under that slot.
+    case slot(MealSlot)
 
     /// Fixed rather than freshly generated, since `.new` carries no identity of its own: a random UUID
     /// re-computed on every access would look like a *different* item to SwiftUI on each diff, which is
     /// exactly the identity churn `Identifiable` exists to avoid.
     private static let newId = UUID()
+    private static let slotIds = Dictionary(uniqueKeysWithValues: MealSlot.allCases.map { ($0, UUID()) })
 
     var id: UUID {
         switch self {
         case .new: Self.newId
         case .edit(let meal): meal.id
+        case .capture(let entry, _): UUID(uuidString: entry.localId) ?? Self.newId
+        case .slot(let slot): Self.slotIds[slot] ?? Self.newId
+        }
+    }
+}
+
+/// A journal day as a sheet item ("YYYY-MM-DD").
+private struct TargetsDay: Identifiable {
+    let id: String
+}
+
+extension JournalTimelineItem<SavedMeal> {
+    /// Meals and captures share one list; their ids never collide (a capture id is prefixed).
+    var id: String {
+        switch self {
+        case .meal(let meal): meal.id.uuidString
+        case .capture(let entry): "capture-" + entry.localId
         }
     }
 }
@@ -155,23 +525,36 @@ private struct MealRow: View {
                 .foregroundStyle(PnColor.inkDefault)
                 .lineLimit(2)
 
-            HStack(spacing: 12) {
-                // roundHalfUp rather than Int(): the corpus rule, so the phone and the web never
-                // disagree about which side of a .5 a number lands on.
-                Text("\(roundHalfUp(meal.totals.energyKcal)) kcal")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(PnColor.brandLeafDeep)
-                macro("P", meal.totals.proteinG)
-                macro("G", meal.totals.carbohydratesG)
-                macro("L", meal.totals.fatG)
+            // An item the server could not compute is named, never shown as 0 kcal: the totals below
+            // already leave it out (see `MealItem.available`).
+            ForEach(meal.items.filter { !$0.isAvailable }) { item in
+                Label("\(item.label) · \(Strings.active.resultsUnavailable)", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(PnColor.onSoftBad)
+                    .lineLimit(2)
+            }
+
+            // Nothing in the meal could be computed: no totals to show, rather than a row of zeros.
+            if meal.items.isEmpty || meal.items.contains(where: \.isAvailable) {
+                HStack(spacing: 12) {
+                    // roundHalfUp rather than Int(): the corpus rule, so the phone and the web never
+                    // disagree about which side of a .5 a number lands on.
+                    Text("\(roundHalfUp(meal.totals.energyKcal)) kcal")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(PnColor.brandLeafDeep)
+                    let s = Strings.active
+                    macro(s.nutrientProteinAbbr, meal.totals.proteinG)
+                    macro(s.nutrientCarbsAbbr, meal.totals.carbohydratesG)
+                    macro(s.nutrientFatAbbr, meal.totals.fatG)
+                }
             }
         }
         .padding(.vertical, 4)
     }
 
-    /// contract: nutrients.proteinAbbr / carbsAbbr / fatAbbr — P, G, L.
+    /// contract: nutrients.proteinAbbr / carbsAbbr / fatAbbr.
     private func macro(_ abbreviation: String, _ grams: Double) -> some View {
-        Text("\(abbreviation) \(formatFrenchNumber((grams * 10).rounded() / 10)) g")
+        Text("\(abbreviation) \(formatNumber((grams * 10).rounded() / 10, lang: LanguageSettings.shared.effective)) g")
             .font(.caption)
             .foregroundStyle(PnColor.inkSoft)
     }

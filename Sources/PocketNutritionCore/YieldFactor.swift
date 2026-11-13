@@ -17,7 +17,7 @@
 /// through the feedback channel and fix in Knowledge, not something for the client to estimate. A
 /// guessed factor would be indistinguishable from a real one in the response.
 ///
-/// Mirrors the router in `pocket-nutrition-ml` and is pinned by the `yield-factor` suite of the
+/// Mirrors the router in `pocket-nutrition/ml` and is pinned by the `yield-factor` suite of the
 /// shared behavioural corpus.
 public func resolveYieldFactor(_ yieldFactors: [String: Double], method: String) -> Double {
     if method == "raw" { return 1 }

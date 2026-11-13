@@ -33,21 +33,56 @@ import PackageDescription
 // The vendored JSON is not declared as a resource either. The tests locate it from `#filePath`, so
 // `contract/` stays one tree that sync-contracts.sh owns byte-for-byte. The trade-off is that these
 // tests must run from a source checkout, which is where they run: `swift test`, in CI and locally.
+// PocketNutritionVault is the exception to "no dependencies": the vault protocol needs Argon2id,
+// XChaCha20-Poly1305 and sealed boxes, none of which Apple ships. It depends on swift-sodium (libsodium),
+// and is declared ONLY when this manifest is read on a Mac. Swift-sodium's libsodium is a prebuilt Apple
+// binary, so on Linux the target would not build and would take PocketNutritionCore's CI down with it.
+// Declaring it behind `#if os(macOS)` keeps Linux CI building and testing Core exactly as before, while
+// `swift test` on a Mac also runs the vault's cross-language crypto vectors.
+//
+// Approved by the maintainer for this one purpose; do not widen it, and keep Core free of it.
+var dependencies: [Package.Dependency] = []
+var products: [Product] = [
+    .library(name: "PocketNutritionCore", targets: ["PocketNutritionCore"])
+]
+var targets: [Target] = [
+    .target(name: "PocketNutritionCore"),
+    .testTarget(
+        name: "PocketNutritionCoreTests",
+        dependencies: ["PocketNutritionCore"]
+    ),
+]
+
+#if os(macOS)
+dependencies.append(.package(url: "https://github.com/jedisct1/swift-sodium.git", from: "0.9.1"))
+products.append(.library(name: "PocketNutritionVault", targets: ["PocketNutritionVault"]))
+targets += [
+    .target(
+        name: "PocketNutritionVault",
+        dependencies: [
+            "PocketNutritionCore",
+            .product(name: "Sodium", package: "swift-sodium"),
+            .product(name: "Clibsodium", package: "swift-sodium"),
+        ]
+    ),
+    .testTarget(
+        name: "PocketNutritionVaultTests",
+        dependencies: ["PocketNutritionVault", "PocketNutritionCore"],
+        exclude: ["README.md"],
+        resources: [.copy("test-vectors.json")]
+    ),
+]
+#endif
+
 let package = Package(
     name: "PocketNutrition",
     platforms: [
         // Matches the app target. The library has no platform-specific code and also builds for
         // Linux, where this declaration is ignored.
-        .iOS(.v17)
+        .iOS(.v17),
+        .macOS(.v14),
     ],
-    products: [
-        .library(name: "PocketNutritionCore", targets: ["PocketNutritionCore"])
-    ],
-    targets: [
-        .target(name: "PocketNutritionCore"),
-        .testTarget(
-            name: "PocketNutritionCoreTests",
-            dependencies: ["PocketNutritionCore"]
-        )
-    ]
+    products: products,
+    dependencies: dependencies,
+    targets: targets
 )

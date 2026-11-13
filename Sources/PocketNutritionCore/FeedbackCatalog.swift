@@ -47,6 +47,8 @@ public enum FeedbackCurrentValueHint: String, Equatable, Sendable {
     case nameFr = "name_fr"
     case nameEn = "name_en"
     case foodGroup = "food_group"
+    /// The cooked/raw weight ratio the app applies for the row's cooking method (`resolveYieldFactor`).
+    case yieldFactor = "yield"
 }
 
 /// One specific, reportable error within a category — "Poids de référence", not just "Mesures".
@@ -94,7 +96,7 @@ public enum FeedbackCatalog {
     //
     // Each mirrors one entry of the deck's `feedback.catalog.optionLists`.
 
-    /// Mirrors `pocket-nutrition-knowledge/serving_unit_types.yaml`. A closed vocabulary — do not
+    /// Mirrors `pocket-nutrition/knowledge/serving_unit_types.yaml`. A closed vocabulary — do not
     /// extend it client-side.
     public static let servingUnits: [FeedbackOption] = [
         FeedbackOption(code: "pinch", label: "pincée"),
@@ -250,7 +252,9 @@ public enum FeedbackCatalog {
             code: "cooking",
             label: "Cuisson",
             errors: [
-                FeedbackErrorDef(code: "yield", label: "Rendement après cuisson", input: .number(suffix: "%")),
+                FeedbackErrorDef(
+                    code: "yield", label: "Rendement après cuisson", input: .number(suffix: "%"), hint: .yieldFactor
+                ),
                 FeedbackErrorDef(
                     code: "cooking_method",
                     label: "Méthode de cuisson manquante",

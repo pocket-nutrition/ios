@@ -47,7 +47,7 @@ struct StepRawWeightVectorTests {
     /// would need only that one value changed to be caught.
     @Test("a unit step ignores the base portion entirely", arguments: [0.0, 75.0, 1000.0])
     func unitStepsIgnoreTheBasePortion(basePortionG: Double) {
-        let carrot = ServingUnit(unit: "item", labelFr: "carotte", volumeMl: 0, grams: 74)
+        let carrot = ServingUnit(unit: "item", labels: [LocalizedText(lang: "fr", text: "carotte")], volumeMl: 0, grams: 74)
         #expect(stepRawWeight(.unit(unit: carrot, count: 2), basePortionG: basePortionG) == 148)
     }
 

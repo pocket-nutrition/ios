@@ -6,7 +6,7 @@
 /// WHY `var` RATHER THAN `let`
 /// The house rule is `let` by default, and this is the documented exception. `applyMethodChange` is
 /// specified as `{ ...ingredient, cookingMethod, quantity }` — a copy with three fields replaced — and
-/// with seventeen `let` fields that becomes a seventeen-argument initialiser call at each of four
+/// with eighteen `let` fields that becomes an eighteen-argument initialiser call at each of four
 /// branches, where a single mis-ordered argument compiles and silently swaps two values. `var` on a
 /// struct keeps the value semantics that matter: `var copy = row` copies, so the caller's row is never
 /// mutated. Immutability is preserved where it counts; only the spelling changes.
@@ -41,6 +41,11 @@ public struct MealIngredient: Equatable, Sendable, Decodable, Identifiable {
     public var yieldFactors: [String: Double]
     public var imageUrl: String?
     public var servingMode: String?
+    /// Set once, at construction from an Open Food Facts product, and never toggled afterwards: the
+    /// backend always analyses these rows at their own values (source "off_direct", cookingMethod
+    /// "raw") regardless of what is requested, so the app locks the row to "raw" and stops offering a
+    /// cooking-method choice for it. See `lockedToRawIfIndustrial` in the App target.
+    public var isIndustrialProduct: Bool
 
     public init(
         id: String,
@@ -59,7 +64,8 @@ public struct MealIngredient: Equatable, Sendable, Decodable, Identifiable {
         canEatRaw: Bool?,
         yieldFactors: [String: Double],
         imageUrl: String?,
-        servingMode: String?
+        servingMode: String?,
+        isIndustrialProduct: Bool = false
     ) {
         self.id = id
         self.label = label
@@ -78,5 +84,38 @@ public struct MealIngredient: Equatable, Sendable, Decodable, Identifiable {
         self.yieldFactors = yieldFactors
         self.imageUrl = imageUrl
         self.servingMode = servingMode
+        self.isIndustrialProduct = isIndustrialProduct
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, ingredientId, cookingMethod, quantity, unit, measuredState,
+             basePortionG, portionFactor, servingUnits, selectedUnit, unitCount,
+             displayUnit, canEatRaw, yieldFactors, imageUrl, servingMode, isIndustrialProduct
+    }
+
+    /// Hand-written so `isIndustrialProduct` decodes to `false` when the key is absent — every vector
+    /// fixture and every server payload predates this field, and the synthesized decoder would
+    /// otherwise throw `keyNotFound` for all of them (default property values are not consulted by
+    /// synthesized `Decodable`; only `Optional` properties get that leniency for free).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        label = try container.decode(String.self, forKey: .label)
+        ingredientId = try container.decode(String.self, forKey: .ingredientId)
+        cookingMethod = try container.decode(String.self, forKey: .cookingMethod)
+        quantity = try container.decode(Double.self, forKey: .quantity)
+        unit = try container.decode(String.self, forKey: .unit)
+        measuredState = try container.decode(String.self, forKey: .measuredState)
+        basePortionG = try container.decode(Double.self, forKey: .basePortionG)
+        portionFactor = try container.decode(Double.self, forKey: .portionFactor)
+        servingUnits = try container.decode([ServingUnit].self, forKey: .servingUnits)
+        selectedUnit = try container.decodeIfPresent(ServingUnit.self, forKey: .selectedUnit)
+        unitCount = try container.decode(Double.self, forKey: .unitCount)
+        displayUnit = try container.decode(String.self, forKey: .displayUnit)
+        canEatRaw = try container.decodeIfPresent(Bool.self, forKey: .canEatRaw)
+        yieldFactors = try container.decode([String: Double].self, forKey: .yieldFactors)
+        imageUrl = try container.decodeIfPresent(String.self, forKey: .imageUrl)
+        servingMode = try container.decodeIfPresent(String.self, forKey: .servingMode)
+        isIndustrialProduct = try container.decodeIfPresent(Bool.self, forKey: .isIndustrialProduct) ?? false
     }
 }

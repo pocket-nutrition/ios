@@ -10,7 +10,7 @@ import PocketNutritionCore
 ///
 /// 1. **MPL-2.0 §3.2.** The licence covers the *executable*, not only the repository. Someone who
 ///    installed the app from a store is a recipient of covered software and must be told they may
-///    read, modify and redistribute the source. A LICENSE file in a Gitea repo reaches developers;
+///    read, modify and redistribute the source. A LICENSE file in a source repository reaches developers;
 ///    it does not reach them.
 /// 2. **ODbL attribution.** Product names, brands and photographs come from Open Food Facts, whose
 ///    Open Database License requires attribution wherever the database is publicly used. Displaying
@@ -42,11 +42,11 @@ struct AboutView: View {
                 .padding(20)
             }
             .background(PnColor.surfacePaper)
-            .navigationTitle(Fr.aboutTitle)
+            .navigationTitle(Strings.active.aboutTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(Fr.aboutClose) { dismiss() }
+                    Button(Strings.active.aboutClose) { dismiss() }
                 }
             }
         }
@@ -56,10 +56,10 @@ struct AboutView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(Fr.brand)
+            Text(Strings.active.brand)
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(PnColor.inkDefault)
-            Text(Fr.aboutVersion(Self.marketingVersion))
+            Text(Strings.active.aboutVersion(Self.marketingVersion))
                 .font(.footnote)
                 .foregroundStyle(PnColor.inkSoft)
         }
@@ -68,32 +68,32 @@ struct AboutView: View {
     }
 
     private var privacySection: some View {
-        section(Fr.aboutPrivacyTitle) {
-            paragraph(Fr.aboutPrivacySummary)
-            paragraph(Fr.aboutPrivacyNetwork)
-            link(Fr.aboutPrivacyLink, Self.privacyPolicyURL)
+        section(Strings.active.aboutPrivacyTitle) {
+            paragraph(Strings.active.aboutPrivacySummary)
+            paragraph(Strings.active.aboutPrivacyNetwork)
+            link(Strings.active.aboutPrivacyLink, Self.privacyPolicyURL)
         }
     }
 
     private var sourcesSection: some View {
-        section(Fr.aboutSourcesTitle) {
-            paragraph(Fr.aboutSourcesBody)
+        section(Strings.active.aboutSourcesTitle) {
+            paragraph(Strings.active.aboutSourcesBody)
         }
     }
 
     private var licenceSection: some View {
-        section(Fr.aboutLicenceTitle) {
-            paragraph(Fr.aboutLicenceBody)
-            link(Fr.aboutSourceLink, Self.sourceURL)
+        section(Strings.active.aboutLicenceTitle) {
+            paragraph(Strings.active.aboutLicenceBody)
+            link(Strings.active.aboutSourceLink, Self.sourceURL)
 
             // Kept in the same card as the licence because it answers the same question: what, other
             // than our own code, is running on your phone. The honest answer for this target is
             // "nothing", and it is checked rather than assumed — see `thirdPartyNone` below.
-            Text(Fr.aboutThirdPartyTitle)
+            Text(Strings.active.aboutThirdPartyTitle)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(PnColor.inkDefault)
                 .padding(.top, 4)
-            paragraph(Fr.aboutThirdPartyNone)
+            paragraph(Strings.active.aboutThirdPartyNone)
         }
     }
 
@@ -155,7 +155,5 @@ struct AboutView: View {
     /// rather than silently rendering a dead row.
     private static let privacyPolicyURL = URL(string: "https://website.pocketnutrition.org/privacy.html")!
 
-    /// Verified reachable **unauthenticated** before shipping. A source link behind a login would
-    /// make `about.licenceBody` untrue in practice, which is the one thing this screen cannot be.
     private static let sourceURL = URL(string: "https://github.com/pocket-nutrition/ios")!
 }

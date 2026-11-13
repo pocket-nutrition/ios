@@ -25,17 +25,24 @@ public enum Shortcut: Equatable, Sendable {
 /// nothing. Either filter can empty the list, and when it does the multipliers come back — which is
 /// how the stated invariant holds: **the result always has between 2 and 4 entries.**
 ///
-/// Pinned by the `shortcut-profile` suite of the shared behavioural corpus.
-public func shortcutProfile(servingUnits: [ServingUnit], displayUnit: String) -> [Shortcut] {
+/// Pinned by the `shortcut-profile`/`shortcut-profile-en` suites of the shared behavioural corpus.
+public func shortcutProfile(servingUnits: [ServingUnit], displayUnit: String, lang: String) -> [Shortcut] {
     let increments = servingUnits
         .filter { !$0.isItem }
         .map { (unit: $0, grams: roundHalfUp(measure($0, displayUnit: displayUnit))) }
         .filter { $0.grams >= 1 }
         .prefix(maximumIncrements)
-        .map { Shortcut.increment(label: $0.unit.labelFr, emoji: servingUnitEmoji($0.unit.unit), grams: $0.grams) }
+        .map {
+            Shortcut.increment(
+                label: pickLocalized($0.unit.labels, preferring: lang) ?? $0.unit.unit,
+                emoji: servingUnitEmoji($0.unit.unit),
+                grams: $0.grams
+            )
+        }
 
-    guard !increments.isEmpty else { return baseMultipliers }
-    return [Shortcut.multiplier(label: "1 Part", factor: 1)] + increments
+    guard !increments.isEmpty else { return baseMultipliers(for: lang) }
+    let onePartLabel = lang == "en" ? "1 Serving" : "1 Part"
+    return [Shortcut.multiplier(label: onePartLabel, factor: 1)] + increments
 }
 
 /// Which of the two weights a unit contributes.
@@ -51,12 +58,23 @@ private func measure(_ unit: ServingUnit, displayUnit: String) -> Double {
 /// Rounded once, here, with the half-up rule: 15,5 g becomes 16 rather than 15. The unit keeps its
 /// precise weight in Knowledge; only the button is rounded.
 ///
-/// The fallback path when nothing is usable. Note these three labels differ from the anchor ladder's
-/// — `portionAnchors.half` is "Demi" and `.onePart` is "1 Part", where the ladder uses "Petite" and
-/// "1 part" with a lowercase p. Two similar-looking sets that are not the same set.
-private let baseMultipliers: [Shortcut] = [
+/// The fallback path when nothing is usable, per language. Note these three labels differ from the
+/// anchor ladder's — `portionAnchors.half` is "Demi" and `.onePart` is "1 Part", where the ladder
+/// uses "Petite" and "1 part" with a lowercase p. Two similar-looking sets that are not the same set,
+/// in either language.
+private func baseMultipliers(for lang: String) -> [Shortcut] {
+    lang == "en" ? baseMultipliersEn : baseMultipliersFr
+}
+
+private let baseMultipliersFr: [Shortcut] = [
     .multiplier(label: "Demi", factor: 0.5),
     .multiplier(label: "1 Part", factor: 1),
+    .multiplier(label: "Double", factor: 2),
+]
+
+private let baseMultipliersEn: [Shortcut] = [
+    .multiplier(label: "Half", factor: 0.5),
+    .multiplier(label: "1 Serving", factor: 1),
     .multiplier(label: "Double", factor: 2),
 ]
 
@@ -66,7 +84,7 @@ private let maximumIncrements = 3
 /// Cosmetic icon per serving-unit type, hardcoded because this is a pure function over a closed
 /// vocabulary — and pinned entry by entry by the `serving-unit-emoji` suite, so drift fails a test.
 ///
-/// Seven of the ten units in `pocket-nutrition-knowledge/serving_unit_types.yaml` carry a glyph.
+/// Seven of the ten units in `pocket-nutrition/knowledge/serving_unit_types.yaml` carry a glyph.
 /// `shot`, `bowl` and `scoop` deliberately do not: none has an unambiguous glyph, 🥣 is already the
 /// cup, and a wrong icon is worse than none. A unit outside the vocabulary is treated the same way, so
 /// nothing here ever needs a placeholder.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+import PhotosUI
 import SwiftUI
 import PocketNutritionCore
 
@@ -29,10 +30,15 @@ import PocketNutritionCore
 struct MealBuilderView: View {
 
     @Environment(JournalStore.self) private var store
+    @Environment(RecognitionEntryStore.self) private var recognitionStore
+    @Environment(RecognitionCoordinator.self) private var recognition
     @Environment(\.dismiss) private var dismiss
 
     /// Set when this screen is editing a previously saved entry rather than composing a new one.
     let editingMeal: SavedMeal?
+    /// The dictation or photo this new meal is made from, opened from the journal. The meal is dated when
+    /// it was captured, and the capture is deleted once the meal is saved (not before: cancelling keeps it).
+    let sourceCapture: RecognitionEntry?
 
     @State private var query = ""
     @State private var suggestions: [IngredientSuggestion] = []
@@ -63,6 +69,15 @@ struct MealBuilderView: View {
     @State private var isScanningBarcode = false
     @FocusState private var isQueryFocused: Bool
 
+    /// Dictating a meal from the search field. The result is added to `items` as soon as it is ready,
+    /// editable like any other row; only a failure or an empty result sends the person to a review.
+    @State private var dictation = DictationSession()
+    /// Dictations whose result has already been added (or set aside), so one is never added twice.
+    @State private var handledDictations: Set<String> = []
+    @State private var dictationNotice: DictationNotice?
+    @State private var reviewTarget: DictationReviewTarget?
+    @State private var libraryPhoto: PhotosPickerItem?
+
     /// How many ingredient phrases the server split the query into, from `X-Segment-Count`. 1 until a
     /// response says otherwise, so the single-term path is what a fresh screen does.
     @State private var segmentCount = 1
@@ -84,8 +99,46 @@ struct MealBuilderView: View {
     /// not need competing for room or attention.
     @State private var isEditingWeight = false
 
-    init(editingMeal: SavedMeal? = nil) {
+    /// When the meal was eaten and which part of the day it belongs to. Guessed, never asked: the time is
+    /// now (or the capture's, or the edited meal's), and the slot follows from it. The chip under the
+    /// title changes either; picking another slot moves the time into that slot's band.
+    @State private var mealDate: Date
+    @State private var slot: MealSlot
+    @State private var isEditingTime = false
+
+    /// Saved dishes and ★ pins (local). A dish applied to this meal is a `DishGroup`: its rows stay
+    /// ordinary rows, and the group remembers each one's saved quantity so a portion step rescales them.
+    @Environment(MealShortcutsStore.self) private var shortcuts
+    @State private var dishGroups: [DishGroup] = []
+    @State private var expandedGroups: Set<UUID> = []
+    @State private var isSavingDish = false
+
+    /// `initialItems` pre-fills a NEW meal with rows built elsewhere (the voice-capture import). It is
+    /// ignored when `editingMeal` is set, and keeps the given order rather than sorting: like `add(_:)`,
+    /// it is the order the person just heard themselves say.
+    init(
+        editingMeal: SavedMeal? = nil, initialItems: [MealIngredient] = [], sourceCapture: RecognitionEntry? = nil,
+        slot initialSlot: MealSlot? = nil
+    ) {
         self.editingMeal = editingMeal
+        self.sourceCapture = editingMeal == nil ? sourceCapture : nil
+        let date: Date
+        if let editingMeal {
+            date = editingMeal.savedAt
+        } else if let sourceCapture {
+            date = Date(timeIntervalSince1970: sourceCapture.createdAt)
+        } else if let initialSlot, initialSlot != mealSlot(for: Date()) {
+            // "+ Breakfast" tapped at 13:00: today, at breakfast time.
+            date = defaultDate(for: initialSlot, on: Date())
+        } else {
+            date = Date()
+        }
+        _mealDate = State(initialValue: date)
+        _slot = State(initialValue: editingMeal?.effectiveSlot ?? initialSlot ?? mealSlot(for: date))
+        if editingMeal == nil, !initialItems.isEmpty {
+            _items = State(initialValue: initialItems)
+            return
+        }
         // Rebuilt from the saved shape rather than kept as-is: the builder works in `MealIngredient`,
         // the journal's persisted shape is `MealItem`, and the conversion happens once, at this
         // boundary, same as the reverse happens once at the save boundary in `ResultsView`.
@@ -110,17 +163,55 @@ struct MealBuilderView: View {
             // priority) blurs it. Without this the only way to dismiss the keyboard was to scroll the
             // results, which is not obvious when the list is short enough not to need scrolling.
             .onTapGesture { isQueryFocused = false }
-            .navigationTitle(Fr.mealHeading)
+            .navigationTitle(Strings.active.mealHeading)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(Fr.searchCancel) { dismiss() }
+                    Button(Strings.active.searchCancel) { dismiss() }
+                }
+                ToolbarItem(placement: .principal) { slotChip }
+                ToolbarItem(placement: .primaryAction) { dishMenu }
+            }
+            .sheet(isPresented: $isEditingTime) { mealTimeSheet }
+            .sheet(isPresented: $isSavingDish) {
+                SaveDishSheet(items: items.map { $0.asMealItem() }) { name, servings in
+                    shortcuts.saveDish(name: name, servings: servings, items: items.map { $0.asMealItem() })
                 }
             }
             .safeAreaInset(edge: .bottom) {
                 if showsSummaryBar {
                     summaryBar
                 }
+            }
+            .fullScreenCover(isPresented: $dictation.isTakingPhoto) {
+                MealCameraView { image in
+                    dictation.isTakingPhoto = false
+                    if let image { dictation.submitPhoto(image, store: recognitionStore, coordinator: recognition) }
+                }
+                .ignoresSafeArea()
+            }
+            .photosPicker(isPresented: $dictation.isPickingFromLibrary, selection: $libraryPhoto, matching: .images)
+            .onChange(of: libraryPhoto) { _, item in
+                guard let item else { return }
+                libraryPhoto = nil
+                Task { await submitLibraryPhoto(item) }
+            }
+            .confirmationDialog(
+                Strings.active.photoStart, isPresented: $dictation.isChoosingPhotoSource, titleVisibility: .hidden
+            ) {
+                if MealCameraView.isAvailable {
+                    Button(Strings.active.photoTake) { dictation.choose(.camera) }
+                }
+                Button(Strings.active.photoChoose) { dictation.choose(.library) }
+                Button(Strings.active.searchCancel, role: .cancel) {}
+            }
+            .alert(Strings.active.photoCameraDeniedTitle, isPresented: $dictation.isCameraDenied) {
+                Button(Strings.active.scanSettingsOpenSettings) {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+                Button(Strings.active.searchCancel, role: .cancel) {}
+            } message: {
+                Text(Strings.active.photoCameraDeniedBody)
             }
             .fullScreenCover(isPresented: $isScanningBarcode) {
                 BarcodeScanFlowView { suggestion in
@@ -146,7 +237,206 @@ struct MealBuilderView: View {
                 if focused { expandedItemId = nil }
             }
             // Only path that supplies a total without a mutation to react to: reopening a saved meal.
-            .onAppear { scheduleRecompute() }
+            .onAppear {
+                scheduleRecompute()
+                recognition.start()
+            }
+            .onDisappear { dictation.saveIfRecording(store: recognitionStore, coordinator: recognition) }
+            .onChange(of: readyDictationIds) { _, ids in ids.forEach(addDictation) }
+            .sheet(isPresented: $dictation.isShowingVault) { VaultView() }
+            .sheet(item: $reviewTarget) { target in
+                NavigationStack {
+                    VoiceReviewView(localId: target.id) { rows in
+                        items.append(contentsOf: rows)
+                        reviewTarget = nil
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(Strings.active.aboutClose) { reviewTarget = nil }
+                        }
+                    }
+                }
+            }
+            .alert(Strings.active.voiceMicExplainerTitle, isPresented: micAlertBinding(.explainer)) {
+                Button(Strings.active.voiceMicExplainerContinue) {
+                    dictation.requestMicrophone(store: recognitionStore, coordinator: recognition)
+                }
+                Button(Strings.active.searchCancel, role: .cancel) {}
+            } message: {
+                Text(Strings.active.voiceMicExplainerBody)
+            }
+            .alert(Strings.active.voiceMicDeniedTitle, isPresented: micAlertBinding(.denied)) {
+                Button(Strings.active.scanSettingsOpenSettings) {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+                Button(Strings.active.searchCancel, role: .cancel) {}
+            } message: {
+                Text(Strings.active.voiceMicDeniedBody)
+            }
+            .alert(
+                Strings.active.error(dictation.errorMessage ?? ""),
+                isPresented: Binding(
+                    get: { dictation.errorMessage != nil }, set: { if !$0 { dictation.errorMessage = nil } })
+            ) {
+                Button(Strings.active.aboutClose, role: .cancel) {}
+            }
+        }
+    }
+
+    // MARK: - Dictation
+
+    /// The library hands over the original file; it is decoded here and re-encoded (metadata dropped)
+    /// before anything is stored or sent.
+    private func submitLibraryPhoto(_ item: PhotosPickerItem) async {
+        guard let data = try? await item.loadTransferable(type: Data.self), let image = UIImage(data: data) else {
+            dictation.errorMessage = Strings.active.photoSaveFailed
+            return
+        }
+        dictation.submitPhoto(image, store: recognitionStore, coordinator: recognition)
+    }
+
+    private func micAlertBinding(_ alert: DictationSession.MicAlert) -> Binding<Bool> {
+        Binding(get: { dictation.micAlert == alert }, set: { if !$0 { dictation.micAlert = nil } })
+    }
+
+    private var recordingRow: some View {
+        HStack(spacing: 12) {
+            Circle().fill(PnColor.statusBad).frame(width: 10, height: 10)
+            Text(Strings.active.voiceElapsed(Int(dictation.recorder.elapsed), of: Int(VoiceRecorder.maxDuration)))
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(PnColor.inkDefault)
+            Spacer(minLength: 0)
+            Button(Strings.active.searchCancel) { dictation.cancel() }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(PnColor.inkSoft)
+            Button(Strings.active.voiceStop) {
+                dictation.stop(store: recognitionStore, coordinator: recognition)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(PnColor.brandLeafDeep)
+        }
+        .padding(12)
+        .pnInput(focused: true)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// Dictations made here whose result is in and not yet added.
+    private var readyDictationIds: [String] {
+        dictation.recordedIds.filter {
+            !handledDictations.contains($0) && recognitionStore.entry($0)?.state == .ready
+        }
+    }
+
+    /// What the dictations made here are doing, under the search field: working, taking long, failed, or
+    /// the outcome of the last one. Ready ones are added to the meal right away, so they do not show.
+    @ViewBuilder
+    private var dictationStatus: some View {
+        VStack(spacing: 8) {
+            ForEach(dictation.recordedIds.filter { !handledDictations.contains($0) }, id: \.self) { localId in
+                if let entry = recognitionStore.entry(localId) { dictationRow(entry) }
+            }
+            if let notice = dictationNotice { noticeRow(notice) }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, dictation.recordedIds.isEmpty && dictationNotice == nil ? 0 : 8)
+    }
+
+    @ViewBuilder
+    private func dictationRow(_ entry: RecognitionEntry) -> some View {
+        let t = Strings.active
+        switch entry.state {
+        case .pendingUpload:
+            dictationBanner(
+                text: recognition.isOffline ? t.dictationSavedOffline : t.dictationAnalyzing,
+                spinner: !recognition.isOffline)
+        case .processing:
+            // Past about 20 s the person is told they may leave; the clock needs to tick to notice.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let waited = context.date.timeIntervalSince1970 - entry.createdAt
+                dictationBanner(
+                    text: waited > Self.slowDictationAfter ? t.dictationSlow : t.dictationAnalyzing,
+                    spinner: true)
+            }
+        case .needsRetry:
+            dictationBanner(text: t.dictationFailed, spinner: false, action: (title: t.voiceRetry, run: {
+                recognition.sendNow(entry.localId)
+            }))
+        case .unrecoverable:
+            dictationBanner(text: t.dictationFailed, spinner: false, action: (title: t.voiceDismiss, run: {
+                handledDictations.insert(entry.localId)
+                recognition.delete(entry.localId)
+            }))
+        case .ready:
+            EmptyView()
+        }
+    }
+
+    private func dictationBanner(
+        text: String, spinner: Bool, action: (title: String, run: () -> Void)? = nil
+    ) -> some View {
+        HStack(spacing: 10) {
+            if spinner { ProgressView().controlSize(.small) }
+            Text(text).font(.footnote).foregroundStyle(PnColor.inkDefault)
+            Spacer(minLength: 0)
+            if let action { Button(action.title, action: action.run).font(.footnote.weight(.semibold)) }
+        }
+        .padding(12)
+        .background(PnColor.surfaceCream)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func noticeRow(_ notice: DictationNotice) -> some View {
+        let t = Strings.active
+        let message: String
+        var review: String?
+        switch notice {
+        case .added(let count): message = t.dictationAdded(count)
+        case .partly(let added, let names): message = t.dictationSkipped(added: added, names: names)
+        case .nothing(let localId):
+            message = t.dictationNothing
+            review = localId
+        }
+        return HStack(spacing: 10) {
+            Text(message).font(.footnote).foregroundStyle(PnColor.inkDefault)
+            Spacer(minLength: 0)
+            if let review {
+                Button(t.dictationReview) { reviewTarget = DictationReviewTarget(id: review) }
+                    .font(.footnote.weight(.semibold))
+            }
+            Button(t.voiceDismiss) { dictationNotice = nil }
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(PnColor.inkSoft)
+        }
+        .padding(12)
+        .background(PnColor.surfaceCream)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    /// Past this, the person is told they can carry on or leave.
+    private static let slowDictationAfter: TimeInterval = 20
+
+    /// Adds what a dictation recognised: the best candidate of each item, resolved like the review screen
+    /// does. The rows are ordinary rows the person can edit or delete. A failure or an empty result keeps
+    /// the entry and offers the review screen; a lookup that merely failed keeps it too, to be tried again
+    /// from the journal, where the entry shows as a meal in progress.
+    private func addDictation(_ localId: String) {
+        guard !handledDictations.contains(localId),
+              let result = recognitionStore.entry(localId)?.result
+        else { return }
+        handledDictations.insert(localId)
+        Task {
+            let selections = result.items.map { ImportSelection(item: $0, candidate: $0.candidates.first) }
+            let outcome = await RecognitionImporter.resolve(selections, lang: LanguageSettings.shared.effective)
+            items.append(contentsOf: outcome.rows)
+            if outcome.rows.isEmpty {
+                dictationNotice = .nothing(localId)
+                return
+            }
+            if canDiscardAfterImport(skips: outcome.skipped.map(\.kind)) { recognition.delete(localId) }
+            dictationNotice = outcome.skipped.isEmpty
+                ? .added(outcome.rows.count)
+                : .partly(added: outcome.rows.count, names: outcome.skipped.map(\.rawText).joined(separator: ", "))
         }
     }
 
@@ -178,11 +468,14 @@ struct MealBuilderView: View {
     /// client. Recorded rather than papered over.
     private var searchField: some View {
         VStack(spacing: 0) {
+            if dictation.recorder.isRecording {
+                recordingRow
+            } else {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(PnColor.inkSoft)
                 TextField(
                     text: $query,
-                    prompt: Text(Fr.searchPlaceholder).foregroundStyle(PnColor.inkSoft)
+                    prompt: Text(Strings.active.searchPlaceholder).foregroundStyle(PnColor.inkSoft)
                 ) { EmptyView() }
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -191,21 +484,40 @@ struct MealBuilderView: View {
                     .onChange(of: query) { _, newValue in scheduleSearch(newValue) }
                 if isSearching { ProgressView().controlSize(.small) }
                 Button {
+                    isQueryFocused = false
+                    dictation.tapMic(store: recognitionStore, coordinator: recognition)
+                } label: {
+                    Image(systemName: "mic").foregroundStyle(PnColor.inkSoft)
+                }
+                .accessibilityLabel(Strings.active.dictationStart)
+                Button {
+                    isQueryFocused = false
+                    dictation.tapPhoto()
+                } label: {
+                    Image(systemName: "camera").foregroundStyle(PnColor.inkSoft)
+                }
+                .accessibilityLabel(Strings.active.photoStart)
+                Button {
                     isScanningBarcode = true
                 } label: {
                     Image(systemName: "barcode.viewfinder").foregroundStyle(PnColor.inkSoft)
                 }
-                .accessibilityLabel(Fr.scanBarcodeButton)
+                .accessibilityLabel(Strings.active.scanBarcodeButton)
             }
             .padding(12)
             .pnInput(focused: isQueryFocused)
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            }
+
+            dictationStatus
+
+            typedShortcuts
 
             if !suggestions.isEmpty {
                 suggestionList
             } else if !query.isEmpty && !isSearching {
-                Text(Fr.searchNoResults)
+                Text(Strings.active.searchNoResults)
                     .font(.footnote)
                     .foregroundStyle(PnColor.inkSoft)
                     .padding(.bottom, 12)
@@ -227,7 +539,7 @@ struct MealBuilderView: View {
     @ViewBuilder
     private var multiTermHint: some View {
         if segmentCount <= 1 {
-            Text(Fr.multiTermHint)
+            Text(Strings.active.multiTermHint)
                 .font(.caption2)
                 .foregroundStyle(PnColor.inkSoft)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -245,14 +557,14 @@ struct MealBuilderView: View {
     private var selectionBar: some View {
         if !selectedIds.isEmpty {
             HStack(spacing: 8) {
-                Button(Fr.searchCancel) {
+                Button(Strings.active.searchCancel) {
                     selectedIds = []
                     query = ""
                 }
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(PnColor.inkSoft)
 
-                Button(Fr.confirmAdd(count: selectedIds.count)) { confirmSelection() }
+                Button(Strings.active.confirmAdd(count: selectedIds.count)) { confirmSelection() }
                     .buttonStyle(PrimaryButtonStyle())
             }
         }
@@ -330,21 +642,23 @@ struct MealBuilderView: View {
         // instead — type "poulet" and the list must never offer "Poule".
         suggestions = []
         selectedIds = []
+        let lang = LanguageSettings.shared.effective
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             do {
-                let found = try await PocketNutritionApi.shared.search(trimmed, limit: maximumSuggestions)
+                let found = try await PocketNutritionApi.shared.search(trimmed, lang: lang, limit: maximumSuggestions)
                 guard !Task.isCancelled else { return }
                 // The corpus rule, not a local tweak: collapses the duplicate labels the API returns,
-                // pins recipes on top, and prefers French once there are enough French results. Without
-                // it a search for "poulet" showed four rows all reading "Poulet / 100 g / Produit".
+                // pins recipes on top, and prefers the active language once there are enough
+                // same-language results. Without it a search for "poulet" showed four rows all reading
+                // "Poulet / 100 g / Produit".
                 //
-                // NOTE it reorders: recipes are lifted to the top and French floats up above
-                // MIN_SAME_LANG. So the server's "first N rows are one best match per term" ordering does
-                // NOT survive to here, which is why multi-select is a free-form checklist rather than one
-                // slot per term. The header is a count, not a mapping.
-                suggestions = deduplicateByLabel(found.rows, preferLanguage: "fr")
+                // NOTE it reorders: recipes are lifted to the top and the preferred language floats up
+                // above MIN_SAME_LANG. So the server's "first N rows are one best match per term"
+                // ordering does NOT survive to here, which is why multi-select is a free-form checklist
+                // rather than one slot per term. The header is a count, not a mapping.
+                suggestions = deduplicateByLabel(found.rows, preferLanguage: lang)
                 segmentCount = found.segmentCount
                 errorMessage = nil
             } catch {
@@ -391,7 +705,8 @@ struct MealBuilderView: View {
         let incoming: [MealIngredient]
         if suggestion.isRecipe {
             incoming = unpackRecipe(suggestion).enumerated().compactMap { index, item in
-                buildMealIngredient(item, id: rowId(suggestion.ingredientId, index))
+                buildMealIngredient(item, id: rowId(suggestion.ingredientId, index))?
+                    .lockedToRawIfIndustrial(isProduct: item.suggestion.isProduct)
             }
         } else {
             incoming = [suggestion.asMealRow(id: rowId(suggestion.ingredientId, 0))]
@@ -415,6 +730,11 @@ struct MealBuilderView: View {
         items.removeAll { $0.id == id }
         if expandedItemId == id { expandedItemId = nil }
         profileCache.removeValue(forKey: id)
+        dishGroups = dishGroups.compactMap { group in
+            var group = group
+            group.base.removeValue(forKey: id)
+            return group.base.isEmpty ? nil : group
+        }
     }
 
     // MARK: - Composed meal
@@ -431,10 +751,12 @@ struct MealBuilderView: View {
         // is tapped and `suggestions` clears, which is the same instant it would have been unable to
         // stay hidden.
         if suggestions.isEmpty {
-            if items.isEmpty {
+            if items.isEmpty && hasQuickPicks {
+                quickPicks
+            } else if items.isEmpty {
                 VStack(spacing: 12) {
                     Text("🥗").font(.system(size: 44))
-                    Text(Fr.mealEmpty)
+                    Text(Strings.active.mealEmpty)
                         .font(.subheadline)
                         .foregroundStyle(PnColor.inkSoft)
                         .multilineTextAlignment(.center)
@@ -443,24 +765,30 @@ struct MealBuilderView: View {
                 .padding(32)
             } else {
                 List {
-                    ForEach($items) { $item in
-                        MealIngredientRow(
-                            row: $item,
-                            isExpanded: expandedItemId == item.id,
-                            onToggleExpand: {
-                                // The row's own tap target consumes the gesture before it can reach the
-                                // outer `.onTapGesture { isQueryFocused = false }` on the whole screen,
-                                // so opening or closing a row left the keyboard up if the search field
-                                // still had focus from adding the item just above it.
-                                isQueryFocused = false
-                                expandedItemId = expandedItemId == item.id ? nil : item.id
-                            },
-                            onEditingWeightChange: { isEditingWeight = $0 }
-                        )
-                        .listRowBackground(PnColor.surfaceCard)
+                    ForEach(listEntries) { entry in
+                        switch entry {
+                        case .group(let group):
+                            DishGroupHeader(
+                                name: group.name,
+                                summary: groupMembers(group).map(\.label).joined(separator: " · "),
+                                kcal: groupKcal(group),
+                                servings: group.servings,
+                                parts: group.parts,
+                                isExpanded: expandedGroups.contains(group.id),
+                                onToggle: {
+                                    if expandedGroups.contains(group.id) { expandedGroups.remove(group.id) } else { expandedGroups.insert(group.id) }
+                                },
+                                onParts: { setParts($0, for: group.id) }
+                            )
+                            .listRowBackground(PnColor.surfaceCard)
+                        case .row(let id):
+                            if let index = items.firstIndex(where: { $0.id == id }) {
+                                rowView(index)
+                            }
+                        }
                     }
                     .onDelete { offsets in
-                        offsets.map { items[$0].id }.forEach(remove)
+                        offsets.map { listEntries[$0] }.forEach(deleteEntry)
                     }
                 }
                 .listStyle(.insetGrouped)
@@ -469,6 +797,42 @@ struct MealBuilderView: View {
         } else {
             Spacer()
         }
+    }
+
+    /// A meal row, bound by id rather than by index: the list can redraw while a row is being removed.
+    @ViewBuilder
+    private func rowView(_ index: Int) -> some View {
+        let snapshot = items[index]
+        if snapshot.isQuickAddRow {
+            QuickAddMealRow(kcal: snapshot.quantity)
+                .listRowBackground(PnColor.surfaceCard)
+        } else {
+            mealRow(Binding(
+                get: { items.first { $0.id == snapshot.id } ?? snapshot },
+                set: { new in
+                    if let current = items.firstIndex(where: { $0.id == snapshot.id }) { items[current] = new }
+                }
+            ))
+        }
+    }
+
+    private func mealRow(_ item: Binding<MealIngredient>) -> some View {
+        MealIngredientRow(
+            row: item,
+            isUnavailable: unavailableRowIds.contains(item.wrappedValue.id),
+            isExpanded: expandedItemId == item.wrappedValue.id,
+            onToggleExpand: {
+                // The row's own tap target consumes the gesture before it can reach the outer
+                // `.onTapGesture { isQueryFocused = false }` on the whole screen, so opening or closing a
+                // row left the keyboard up if the search field still had focus from adding the item just
+                // above it.
+                isQueryFocused = false
+                let id = item.wrappedValue.id
+                expandedItemId = expandedItemId == id ? nil : id
+            },
+            onEditingWeightChange: { isEditingWeight = $0 }
+        )
+        .listRowBackground(PnColor.surfaceCard)
     }
 
     // MARK: - Totals
@@ -490,9 +854,25 @@ struct MealBuilderView: View {
 
     /// Summed here rather than requested: `POST /nutrition` answers per item, and summing on the client
     /// keeps the total honest when one row fails to resolve — the visible rows always add up to the
-    /// total shown. Ported from the former `ResultsView`, unchanged.
+    /// total shown. Ported from the former `ResultsView`. A row the server could not compute
+    /// (`available: false`) is left out: its placeholder zeros are not a measurement.
     private var totals: Macros {
-        (results ?? []).map(Macros.init).reduce(Macros.zero, +)
+        (results ?? []).countable.map(Macros.init).reduce(Macros.zero, +)
+    }
+
+    /// Rows the server answered with `available: false`, by row id. Read from `profileCache`, which
+    /// keeps each row's last server answer under its id, rather than by zipping `results` with `items`:
+    /// that zip is empty whenever the two are out of step (a row added or removed while a request is
+    /// in flight), and a meal saved in that window would lose the flag while its totals still left
+    /// the row out.
+    private var unavailableRowIds: Set<String> {
+        Set(items.filter { profileCache[$0.id]?.profile.isAvailable == false }.map(\.id))
+    }
+
+    /// Analysed, and not one row could be computed: there is no total to show, not a total of 0.
+    private var hasNoCountableResult: Bool {
+        guard let results, !results.isEmpty else { return false }
+        return results.countable.isEmpty
     }
 
     /// What used to be `ResultsView`'s whole screen — a total, and a save action — folded into this
@@ -512,11 +892,11 @@ struct MealBuilderView: View {
             if suggestions.isEmpty {
                 if let errorMessage {
                     HStack {
-                        Text(Fr.error(errorMessage))
+                        Text(Strings.active.error(errorMessage))
                             .font(.footnote)
                             .foregroundStyle(PnColor.onSoftBad)
                         Spacer()
-                        Button(Fr.retry) { scheduleRecompute(debounced: false) }
+                        Button(Strings.active.retry) { scheduleRecompute(debounced: false) }
                             .font(.footnote.weight(.semibold))
                     }
                     .padding(12)
@@ -529,7 +909,7 @@ struct MealBuilderView: View {
                 if !items.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
-                            Text(Fr.resultsTotal)
+                            Text(Strings.active.resultsTotal)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(PnColor.inkSoft)
                             if isComputingTotals {
@@ -537,16 +917,22 @@ struct MealBuilderView: View {
                             }
                         }
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("\(roundHalfUp(totals.energyKcal)) kcal")
-                                .font(.title3.weight(.bold))
-                                .foregroundStyle(PnColor.brandLeafDeep)
-                            Text(macroSummary)
-                                .font(.caption)
-                                .foregroundStyle(PnColor.inkSoft)
+                            if hasNoCountableResult {
+                                Text(Strings.active.resultsTotalUnknown)
+                                    .font(.title3.weight(.bold))
+                                    .foregroundStyle(PnColor.inkSoft)
+                            } else {
+                                Text("\(roundHalfUp(totals.energyKcal)) kcal")
+                                    .font(.title3.weight(.bold))
+                                    .foregroundStyle(PnColor.brandLeafDeep)
+                                Text(macroSummary)
+                                    .font(.caption)
+                                    .foregroundStyle(PnColor.inkSoft)
+                            }
                         }
                     }
 
-                    Button(Fr.resultsSave) { save() }
+                    Button(Strings.active.resultsSave) { save() }
                         .buttonStyle(PrimaryButtonStyle())
                         // Nothing to save before the first total lands, and nothing to save twice.
                         .disabled(results == nil || hasSaved)
@@ -558,9 +944,11 @@ struct MealBuilderView: View {
     }
 
     private var macroSummary: String {
-        "P \(formatFrenchNumber((totals.proteinG * 10).rounded() / 10)) g · "
-            + "G \(formatFrenchNumber((totals.carbohydratesG * 10).rounded() / 10)) g · "
-            + "L \(formatFrenchNumber((totals.fatG * 10).rounded() / 10)) g"
+        let lang = LanguageSettings.shared.effective
+        let s = Strings.active
+        return "\(s.nutrientProteinAbbr) \(formatNumber((totals.proteinG * 10).rounded() / 10, lang: lang)) g · "
+            + "\(s.nutrientCarbsAbbr) \(formatNumber((totals.carbohydratesG * 10).rounded() / 10, lang: lang)) g · "
+            + "\(s.nutrientFatAbbr) \(formatNumber((totals.fatG * 10).rounded() / 10, lang: lang)) g"
     }
 
     /// Debounced the same way `scheduleSearch` is, and for the same reason: a burst of changes — every
@@ -590,6 +978,15 @@ struct MealBuilderView: View {
         // same-state server baseline needs no request at all — see `locallyRescaledResults`. This is
         // the common case a typed weight or a stepper tap hits, and it resolves instantly rather than
         // waiting out the debounce below, because there is no network round trip to wait for.
+        // Quick-add rows carry their own energy and are never sent: with nothing else in the meal there is
+        // no request at all.
+        if !items.contains(where: { !$0.isQuickAddRow }) {
+            results = merged([], into: items)
+            errorMessage = nil
+            isComputingTotals = false
+            return
+        }
+
         if let rescaled = locallyRescaledResults() {
             results = rescaled
             errorMessage = nil
@@ -607,9 +1004,10 @@ struct MealBuilderView: View {
                 // Snapshotted rather than read again after the `await` below: `items` could have
                 // changed while the request was in flight, and the cache must remember what was
                 // actually asked for, not whatever is on screen by the time the answer arrives.
-                let requested = items
+                let snapshot = items
+                let requested = snapshot.filter { !$0.isQuickAddRow }
                 let profiles = try await PocketNutritionApi.shared.analyse(requested.map { $0.asRequest() })
-                results = profiles
+                results = merged(profiles, into: snapshot)
                 errorMessage = nil
                 for (item, profile) in zip(requested, profiles) {
                     profileCache[item.id] = ProfileBaseline(
@@ -625,6 +1023,21 @@ struct MealBuilderView: View {
             }
             isComputingTotals = false
         }
+    }
+
+    /// The server's answers for the real rows, with each quick-add row's own energy put back in place, so
+    /// `results` stays aligned with `items` row for row.
+    private func merged(_ profiles: [NutritionalProfile], into rows: [MealIngredient]) -> [NutritionalProfile] {
+        var answers = profiles.makeIterator()
+        return rows.compactMap { $0.isQuickAddRow ? Self.quickAddProfile($0) : answers.next() }
+    }
+
+    /// Energy only: the person typed a calorie figure, so every other nutrient is unknown, not zero.
+    private static func quickAddProfile(_ row: MealIngredient) -> NutritionalProfile {
+        NutritionalProfile(
+            name: row.label, quantity: row.quantity, unit: "kcal", cookingMethod: "", measuredState: "",
+            energyKcal: row.quantity, proteinG: 0, fatG: 0, carbohydratesG: 0, fiberG: nil, sugarsG: nil,
+            nutrients: NutrientTotals(["energyKcal": row.quantity]))
     }
 
     /// One server-confirmed answer for one row, and the exact inputs it was correct for. A cached
@@ -647,6 +1060,10 @@ struct MealBuilderView: View {
         var rescaled: [NutritionalProfile] = []
         rescaled.reserveCapacity(items.count)
         for item in items {
+            if item.isQuickAddRow {
+                rescaled.append(Self.quickAddProfile(item))
+                continue
+            }
             guard let baseline = profileCache[item.id],
                   baseline.cookingMethod == item.cookingMethod,
                   baseline.measuredState == item.measuredState,
@@ -657,16 +1074,342 @@ struct MealBuilderView: View {
         return rescaled
     }
 
+    // MARK: - Dishes, recents, quick add
+
+    /// A dish applied to this meal. Its rows are ordinary rows; `base` keeps each row's quantity as saved
+    /// in the dish (for `servings` portions), so a portion step rescales from the dish, not from a row the
+    /// person may have edited since.
+    private struct DishGroup: Identifiable, Equatable {
+        let id = UUID()
+        let dishId: UUID
+        let name: String
+        let servings: Int
+        var parts: Double
+        var base: [String: Double]
+    }
+
+    private enum ListEntry: Identifiable {
+        case group(DishGroup)
+        case row(String)
+
+        var id: String {
+            switch self {
+            case .group(let group): "group-\(group.id.uuidString)"
+            case .row(let id): id
+            }
+        }
+    }
+
+    /// The meal list: each dish's head just before its first row; a folded dish hides its rows.
+    private var listEntries: [ListEntry] {
+        var entries: [ListEntry] = []
+        var emitted: Set<UUID> = []
+        for item in items {
+            if let group = dishGroups.first(where: { $0.base[item.id] != nil }) {
+                if emitted.insert(group.id).inserted { entries.append(.group(group)) }
+                if !expandedGroups.contains(group.id) { continue }
+            }
+            entries.append(.row(item.id))
+        }
+        return entries
+    }
+
+    private func groupMembers(_ group: DishGroup) -> [MealIngredient] {
+        items.filter { group.base[$0.id] != nil }
+    }
+
+    private func groupKcal(_ group: DishGroup) -> Double? {
+        guard let results, results.count == items.count else { return nil }
+        return zip(items, results).reduce(0) { sum, pair in
+            group.base[pair.0.id] != nil && pair.1.isAvailable ? sum + pair.1.energyKcal : sum
+        }
+    }
+
+    private func deleteEntry(_ entry: ListEntry) {
+        switch entry {
+        case .row(let id): remove(id)
+        case .group(let group): group.base.keys.forEach(remove)
+        }
+    }
+
+    private func setParts(_ parts: Double, for groupId: UUID) {
+        guard let index = dishGroups.firstIndex(where: { $0.id == groupId }) else { return }
+        dishGroups[index].parts = parts
+        let group = dishGroups[index]
+        for (rowId, saved) in group.base {
+            guard let row = items.firstIndex(where: { $0.id == rowId }) else { continue }
+            items[row] = Self.resized(
+                items[row], to: scaleDishQuantity(saved, servings: Double(group.servings), parts: parts))
+        }
+    }
+
+    private static func resized(_ row: MealIngredient, to quantity: Double) -> MealIngredient {
+        var copy = row
+        copy.quantity = quantity
+        copy.basePortionG = quantity
+        copy.portionFactor = 1
+        copy.unitCount = 1
+        return copy
+    }
+
+    /// One portion of the dish (a quarter of a gratin saved for 4), folded into one row with a stepper.
+    private func apply(_ dish: Dish) {
+        var group = DishGroup(dishId: dish.id, name: dish.name, servings: dish.servings, parts: 1, base: [:])
+        let rows = dish.items.enumerated().map { index, item -> MealIngredient in
+            let row = item.asMealIngredient(id: rowId(item.ingredientId ?? "dish", index))
+            group.base[row.id] = item.quantityG
+            return Self.resized(row, to: scaleDishQuantity(item.quantityG, servings: Double(dish.servings), parts: 1))
+        }
+        guard !rows.isEmpty else { return }
+        dishGroups.append(group)
+        items.append(contentsOf: rows)
+        shortcuts.markUsed(dish.id)
+        clearSearch()
+    }
+
+    /// A past food, as it was last logged (same quantity, cooking and state).
+    private func addRecent(_ food: RecentFood) {
+        items.append(food.item.asMealIngredient(id: rowId(food.item.ingredientId ?? "recent", 0)))
+        clearSearch()
+    }
+
+    private func addQuickAdd(_ kcal: Int) {
+        items.append(.quickAdd(kcal: Double(kcal), id: rowId("quick-add", 0)))
+        clearSearch()
+    }
+
+    private func clearSearch() {
+        query = ""
+        suggestions = []
+    }
+
+    /// Rows of the meal that belong to an applied dish and differ from it: offered as "update the dish".
+    private var updatableGroup: DishGroup? {
+        dishGroups.first { group in
+            guard let dish = shortcuts.dishes.first(where: { $0.id == group.dishId }) else { return false }
+            let current = groupMembers(group).map { $0.asMealItem() }
+            let saved = dish.items.map { item -> MealItem in
+                var scaled = item
+                scaled.quantityG = scaleDishQuantity(item.quantityG, servings: Double(group.servings), parts: group.parts)
+                return scaled
+            }
+            return current.map(\.label) != saved.map(\.label)
+                || zip(current, saved).contains { $0.quantityG != $1.quantityG || $0.cookingMethod != $1.cookingMethod }
+        }
+    }
+
+    private var dishMenu: some View {
+        Menu {
+            Button {
+                isSavingDish = true
+            } label: {
+                Label(Strings.active.saveAsDish, systemImage: "square.and.arrow.down")
+            }
+            .disabled(!items.contains { !$0.isQuickAddRow })
+            if let group = updatableGroup {
+                Button {
+                    // Back to quantities for the dish's full batch, from the portion shown.
+                    let ratio = group.parts > 0 ? Double(group.servings) / group.parts : 1
+                    let updated = groupMembers(group).map { row -> MealItem in
+                        var item = row.asMealItem()
+                        item.quantityG = (item.quantityG * ratio * 10).rounded() / 10
+                        return item
+                    }
+                    shortcuts.updateItems(of: group.dishId, to: updated)
+                } label: {
+                    Label(Strings.active.dishUpdate(group.name), systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .accessibilityLabel(Strings.active.dishMenuA11y)
+    }
+
+    private var recentsForSlot: [RecentFood] { store.recentFoods(for: slot, limit: 8) }
+
+    private var hasQuickPicks: Bool { !shortcuts.dishes.isEmpty || !recentsForSlot.isEmpty }
+
+    /// The empty meal's suggestions: saved dishes, then what is usually eaten at this time of day, each
+    /// added in one tap. Pinned ones first. Long press to pin, rename or delete.
+    private var quickPicks: some View {
+        let t = Strings.active
+        let recents = recentsForSlot.sorted { shortcuts.isPinned($0.key) && !shortcuts.isPinned($1.key) }
+        return List {
+            if !shortcuts.dishes.isEmpty {
+                Section(t.dishesTitle) {
+                    ForEach(shortcuts.dishesByRelevance) { dish in
+                        let key = MealShortcutsStore.dishKey(dish.id)
+                        ShortcutRow(
+                            title: dish.name,
+                            detail: t.dishDetail(ingredients: dish.items.count, servings: dish.servings),
+                            isPinned: shortcuts.isPinned(key),
+                            onAdd: { apply(dish) }
+                        )
+                        .contextMenu {
+                            Button(shortcuts.isPinned(key) ? t.unpin : t.pin) { shortcuts.togglePin(key) }
+                            Button(t.deleteDish, role: .destructive) { shortcuts.delete(dish.id) }
+                        }
+                        .listRowBackground(PnColor.surfaceCard)
+                    }
+                }
+            }
+            if !recents.isEmpty {
+                Section(t.recentsTitle(slot)) {
+                    ForEach(recents) { food in
+                        ShortcutRow(
+                            title: food.item.label,
+                            detail: t.recentDetail(grams: food.item.quantityG, method: food.item.cookingMethod),
+                            isPinned: shortcuts.isPinned(food.key),
+                            onAdd: { addRecent(food) }
+                        )
+                        .contextMenu {
+                            Button(shortcuts.isPinned(food.key) ? t.unpin : t.pin) { shortcuts.togglePin(food.key) }
+                        }
+                        .listRowBackground(PnColor.surfaceCard)
+                    }
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    /// While typing: a bare calorie figure offers a quick add, and saved dishes or past foods that match
+    /// come before the catalogue.
+    @ViewBuilder
+    private var typedShortcuts: some View {
+        let t = Strings.active
+        let needle = query.trimmingCharacters(in: .whitespaces).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        let kcal = parseQuickAddKcal(query)
+        let dishes = needle.count < 2 ? [] : shortcuts.dishesByRelevance.filter {
+            $0.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(needle)
+        }.prefix(3)
+        let foods = needle.count < 2 ? [] : store.recentFoods(for: slot, limit: 50).filter {
+            $0.item.label.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(needle)
+        }.prefix(3)
+        if kcal != nil || !dishes.isEmpty || !foods.isEmpty {
+            VStack(spacing: 0) {
+                if let kcal {
+                    ShortcutRow(title: t.quickAddRow(kcal), detail: t.quickAddNote, isPinned: false) { addQuickAdd(kcal) }
+                        .padding(.vertical, 6)
+                }
+                ForEach(Array(dishes)) { dish in
+                    ShortcutRow(
+                        title: dish.name, detail: t.dishDetail(ingredients: dish.items.count, servings: dish.servings),
+                        isPinned: shortcuts.isPinned(MealShortcutsStore.dishKey(dish.id))
+                    ) { apply(dish) }
+                    .padding(.vertical, 6)
+                }
+                ForEach(Array(foods)) { food in
+                    ShortcutRow(
+                        title: food.item.label,
+                        detail: t.recentDetail(grams: food.item.quantityG, method: food.item.cookingMethod),
+                        isPinned: shortcuts.isPinned(food.key)
+                    ) { addRecent(food) }
+                    .padding(.vertical, 6)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 4)
+            .pnCard()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+        }
+    }
+
+    // MARK: - Slot and time
+
+    private var slotChip: some View {
+        Menu {
+            ForEach(MealSlot.allCases.sorted { $0.order < $1.order }, id: \.self) { candidate in
+                Button {
+                    choose(candidate)
+                } label: {
+                    if candidate == slot {
+                        Label(Strings.active.mealSlotName(candidate), systemImage: "checkmark")
+                    } else {
+                        Text(Strings.active.mealSlotName(candidate))
+                    }
+                }
+            }
+            Divider()
+            Button(Strings.active.mealChangeTime) { isEditingTime = true }
+        } label: {
+            VStack(spacing: 1) {
+                Text(Strings.active.mealHeading).font(.headline).foregroundStyle(PnColor.inkDefault)
+                HStack(spacing: 3) {
+                    Text(Strings.active.mealSlotName(slot) + " · " + Self.timeLabel(mealDate))
+                    Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(PnColor.brandLeafDeep)
+            }
+        }
+        .accessibilityLabel(Strings.active.mealSlotName(slot) + ", " + Self.timeLabel(mealDate))
+    }
+
+    /// Another slot moves the time into its band (same day), unless the time already falls there.
+    private func choose(_ candidate: MealSlot) {
+        slot = candidate
+        if mealSlot(for: mealDate) != candidate {
+            mealDate = defaultDate(for: candidate, on: mealDate)
+        }
+    }
+
+    private var mealTimeSheet: some View {
+        NavigationStack {
+            DatePicker(
+                Strings.active.mealTimeTitle, selection: $mealDate, in: ...Date().addingTimeInterval(3600),
+                displayedComponents: [.date, .hourAndMinute]
+            )
+            .datePickerStyle(.graphical)
+            .padding()
+            .navigationTitle(Strings.active.mealTimeTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(Strings.active.aboutClose) {
+                        slot = mealSlot(for: mealDate)
+                        isEditingTime = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private static func timeLabel(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: LanguageSettings.shared.effective == "en" ? "en_US" : "fr_FR")
+        if Calendar.current.isDateInToday(date) {
+            formatter.timeStyle = .short
+            formatter.dateStyle = .none
+        } else {
+            formatter.setLocalizedDateFormatFromTemplate("EEE d MMM HH:mm")
+        }
+        return formatter.string(from: date)
+    }
+
     private func save() {
         // Guarded rather than merely disabled: a double tap that lands before the view updates would
         // otherwise write the meal twice, and a duplicated diary entry is worse than a missed one.
         guard !hasSaved, results != nil else { return }
         hasSaved = true
-        let savedItems = items.map { $0.asMealItem() }
+        let unavailable = unavailableRowIds
+        let savedItems = items.map { row -> MealItem in
+            var item = row.asMealItem()
+            if unavailable.contains(row.id) { item.available = false }
+            return item
+        }
+        let nutrients = (results ?? []).countableNutrients
         if let editingMealId = editingMeal?.id {
-            store.update(id: editingMealId, items: savedItems, totals: totals)
+            store.update(
+                id: editingMealId, items: savedItems, totals: totals, savedAt: mealDate, slot: slot,
+                nutrients: nutrients)
         } else {
-            store.save(items: savedItems, totals: totals)
+            store.save(items: savedItems, totals: totals, at: mealDate, slot: slot, nutrients: nutrients)
+            if let capture = sourceCapture { recognition.delete(capture.localId) }
         }
         dismiss()
     }
@@ -789,7 +1532,7 @@ private struct SuggestionRow: View {
 
     private var title: String {
         suggestion.isRecipe
-            ? String(format: Fr.searchRecipePrefix, suggestion.label)
+            ? String(format: Strings.active.searchRecipePrefix, suggestion.label)
             : suggestion.label
     }
 
@@ -800,26 +1543,26 @@ private struct SuggestionRow: View {
             let names = (suggestion.recipeComponents ?? []).map(\.ingredient.label)
             return names.isEmpty ? nil : names.joined(separator: ", ")
         }
-        let grams = suggestion.servingG.map { "\(formatFrenchNumber($0)) g" }
+        let grams = suggestion.servingG.map { "\(formatNumber($0, lang: LanguageSettings.shared.effective)) g" }
         return [suggestion.brand, grams].compactMap { $0 }.joined(separator: " · ").nilIfEmpty
     }
 
     @ViewBuilder
     private var trailingBadge: some View {
         if alreadyAdded {
-            Text(Fr.searchAlreadyAdded)
+            Text(Strings.active.searchAlreadyAdded)
                 .font(.caption2)
                 .foregroundStyle(PnColor.inkSoft)
         } else if suggestion.isRecipe {
             let count = (suggestion.recipeComponents ?? []).count
-            Text(String(format: Fr.searchRecipeComponentCount, count))
+            Text(String(format: Strings.active.searchRecipeComponentCount, count))
                 .font(.caption2.weight(.medium))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(PnColor.huePlumSoft)
                 .foregroundStyle(PnColor.onSoftPlum)
                 .clipShape(Capsule())
         } else if suggestion.isProduct {
-            Text(Fr.searchProductBadge)
+            Text(Strings.active.searchProductBadge)
                 .font(.caption2.weight(.medium))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(PnColor.hueSeaSoft)
@@ -852,7 +1595,9 @@ private extension NutritionalProfile {
             fatG: fatG * ratio,
             carbohydratesG: carbohydratesG * ratio,
             fiberG: fiberG.map { $0 * ratio },
-            sugarsG: sugarsG.map { $0 * ratio }
+            sugarsG: sugarsG.map { $0 * ratio },
+            nutrients: nutrients.scaled(by: ratio),
+            isAvailable: isAvailable
         )
     }
 }
@@ -874,6 +1619,9 @@ private extension NutritionalProfile {
 /// weighed-state toggle needs, and that toggle is the more consequential of the two by a wide margin.
 private struct MealIngredientRow: View {
     @Binding var row: MealIngredient
+    /// The server could not compute this row (`available: false`): say so instead of letting the meal
+    /// total read as if the row were 0 kcal. Removing it is the List's usual swipe.
+    var isUnavailable = false
     let isExpanded: Bool
     let onToggleExpand: () -> Void
     /// Forwarded straight from `PortionLadder`'s own `onEditingChange` — see that type's doc comment.
@@ -908,6 +1656,7 @@ private struct MealIngredientRow: View {
         VStack(alignment: .leading, spacing: 10) {
             if isExpanded {
                 expandedHeader
+                if isUnavailable { unavailableNote }
                 PortionLadder(row: $row, onEditingChange: onEditingWeightChange)
                 feedbackFooter
             } else {
@@ -940,18 +1689,28 @@ private struct MealIngredientRow: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(PnColor.inkDefault)
                     .lineLimit(1)
-                if !row.summary.primary.isEmpty {
-                    Text(row.summary.primary)
+                let summary = row.summary(lang: LanguageSettings.shared.effective)
+                if isUnavailable {
+                    unavailableNote
+                } else if !summary.primary.isEmpty {
+                    Text(summary.primary)
                         .font(.caption2)
                         .foregroundStyle(PnColor.inkSoft)
                         .lineLimit(1)
                 }
             }
             Spacer(minLength: 8)
-            Text("\(formatFrenchNumber(row.quantity)) \(row.displayUnit == "ml" ? "mL" : "g")")
+            Text("\(formatNumber(row.quantity, lang: LanguageSettings.shared.effective)) \(row.displayUnit == "ml" ? "mL" : "g")")
                 .font(.caption)
                 .foregroundStyle(PnColor.inkSoft)
         }
+    }
+
+    /// contract: results.unavailable.
+    private var unavailableNote: some View {
+        Label(Strings.active.resultsUnavailable, systemImage: "exclamationmark.triangle")
+            .font(.caption2)
+            .foregroundStyle(PnColor.onSoftBad)
     }
 
     // MARK: - Expanded
@@ -1013,13 +1772,13 @@ private struct MealIngredientRow: View {
                 HStack(spacing: 4) {
                     Image(systemName: "flag")
                         .font(.caption2)
-                    Text(Fr.ingredientReport)
+                    Text(Strings.active.ingredientReport)
                         .font(.caption)
                 }
                 .foregroundStyle(PnColor.inkSoft)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(Fr.ingredientReportAria)
+            .accessibilityLabel(Strings.active.ingredientReportAria)
         }
     }
 
@@ -1028,7 +1787,19 @@ private struct MealIngredientRow: View {
     /// States the current answer rather than being a bare disclosure arrow — "🔥 Grillé (pesé après
     /// cuisson)". A chevron alone would hide two decisions that change the numbers, and the point of
     /// collapsing is to save room, not to save the user from knowing.
+    ///
+    /// Absent entirely for an Open Food Facts product: the backend always analyses it at its own
+    /// values regardless of cooking method, so there is no cooking-method state worth showing.
+    @ViewBuilder
     private var methodPill: some View {
+        if row.isIndustrialProduct {
+            EmptyView()
+        } else {
+            realMethodPill
+        }
+    }
+
+    private var realMethodPill: some View {
         Button {
             isPickingMethod = true
         } label: {
@@ -1044,19 +1815,19 @@ private struct MealIngredientRow: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(Fr.changeCooking)
+        .accessibilityLabel(Strings.active.changeCooking)
         .accessibilityValue(pillText)
     }
 
     private var pillText: String {
         let method = PnCooking.methods.first { $0.id == row.cookingMethod }
         let emoji = row.cookingMethod == "raw" ? "🌿" : (method?.emoji ?? "🍲")
-        let label = Fr.cookingMethod(row.cookingMethod)
+        let label = Strings.active.cookingMethod(row.cookingMethod)
         // The weighed state is only meaningful once something has been cooked: a raw weight of a raw
         // food is the same number either way, so appending "(pesé avant cuisson)" there would be noise
         // dressed as information. The sandbox makes the same call.
         guard row.cookingMethod != "raw" else { return "\(emoji) \(label)" }
-        return "\(emoji) \(label) \(Fr.weighedInline(Fr.measuredWhen(row.measuredState)))"
+        return "\(emoji) \(label) \(Strings.active.weighedInline(Strings.active.measuredWhen(row.measuredState)))"
     }
 
     private var pillBackground: Color {
@@ -1090,7 +1861,7 @@ private struct MealIngredientRow: View {
                         let selected = method.id == row.cookingMethod
                         methodOptionRow(
                             emoji: method.emoji,
-                            label: Fr.cookingMethod(method.id),
+                            label: Strings.active.cookingMethod(method.id),
                             subtitle: yieldHint(for: method.id),
                             selected: selected
                         ) {
@@ -1106,17 +1877,17 @@ private struct MealIngredientRow: View {
                 // way as the method list above it instead of switching shape halfway down the sheet.
                 // Hidden for raw rows, where there is nothing to convert and the question has no answer.
                 if row.cookingMethod != "raw" {
-                    Section(Fr.weighedLabel) {
+                    Section(Strings.active.weighedLabel) {
                         methodOptionRow(
                             emoji: "🌿",
-                            label: Fr.measuredBeforeLong,
+                            label: Strings.active.measuredBeforeLong,
                             selected: row.measuredState == "raw"
                         ) {
                             row = switchMeasuredState(row, to: "raw")
                         }
                         methodOptionRow(
                             emoji: "🍽️",
-                            label: Fr.measuredAfterLong,
+                            label: Strings.active.measuredAfterLong,
                             selected: row.measuredState == "cooked"
                         ) {
                             row = switchMeasuredState(row, to: "cooked")
@@ -1124,11 +1895,11 @@ private struct MealIngredientRow: View {
                     }
                 }
             }
-            .navigationTitle(Fr.mealCooking)
+            .navigationTitle(Strings.active.mealCooking)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(Fr.aboutClose) { isPickingMethod = false }
+                    Button(Strings.active.aboutClose) { isPickingMethod = false }
                 }
             }
         }
@@ -1149,9 +1920,9 @@ private struct MealIngredientRow: View {
         let factor = resolveYieldFactor(row.yieldFactors, method: methodId)
         guard factor != 1 else { return nil }
         let ratio = factor > 1 ? factor : 1 / factor
-        let display = formatFrenchNumber((ratio * 10).rounded() / 10)
-        let direction = factor > 1 ? "plus" : "moins"
-        return "Cet aliment pèse \(display)x \(direction) lourd une fois cuit"
+        let lang = LanguageSettings.shared.effective
+        let display = formatNumber((ratio * 10).rounded() / 10, lang: lang)
+        return Strings.active.yieldHint(display: display, heavier: factor > 1)
     }
 
     /// One row of the sheet's method (or weighed-state) list: emoji, label, an optional yield subtitle,
@@ -1212,11 +1983,11 @@ private struct MealIngredientRow: View {
                     feedbackFormView
                 }
             }
-            .navigationTitle(Fr.feedbackTitle)
+            .navigationTitle(Strings.active.feedbackTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(Fr.feedbackClose) { isReportingFeedback = false }
+                    Button(Strings.active.feedbackClose) { isReportingFeedback = false }
                 }
             }
         }
@@ -1236,7 +2007,7 @@ private struct MealIngredientRow: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(PnColor.brandLeafDeep)
-            Text(Fr.feedbackSuccess)
+            Text(Strings.active.feedbackSuccess)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(PnColor.inkDefault)
         }
@@ -1246,8 +2017,12 @@ private struct MealIngredientRow: View {
 
     private var feedbackFormView: some View {
         List {
+            Section {
+                DisclosureGroup(Strings.active.feedbackCurrentDataTitle) { feedbackCurrentData }
+            }
+
             if !feedbackCorrections.isEmpty {
-                Section {
+                Section(Strings.active.feedbackPendingTitle) {
                     ForEach(Array(feedbackCorrections.enumerated()), id: \.offset) { index, correction in
                         HStack {
                             Text(feedbackCorrectionSummary(correction))
@@ -1262,13 +2037,13 @@ private struct MealIngredientRow: View {
                                     .foregroundStyle(PnColor.inkSoft)
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel(Fr.feedbackRemoveCorrection)
+                            .accessibilityLabel(Strings.active.feedbackRemoveCorrection)
                         }
                     }
                 }
             }
 
-            Section(Fr.feedbackIntro) {
+            Section(Strings.active.feedbackIntro) {
                 ForEach(FeedbackCatalog.categories) { category in
                     DisclosureGroup(category.label) {
                         ForEach(category.errors) { error in
@@ -1278,8 +2053,8 @@ private struct MealIngredientRow: View {
                 }
             }
 
-            Section(Fr.feedbackComment) {
-                TextField(Fr.feedbackComment, text: $feedbackComment, axis: .vertical)
+            Section(Strings.active.feedbackComment) {
+                TextField(Strings.active.feedbackComment, text: $feedbackComment, axis: .vertical)
                     .lineLimit(2...4)
                     .onChange(of: feedbackComment) {
                         if feedbackStatus == .error { feedbackStatus = .idle }
@@ -1295,7 +2070,7 @@ private struct MealIngredientRow: View {
                         if feedbackStatus == .sending {
                             ProgressView()
                         } else {
-                            Text(Fr.feedbackSubmit)
+                            Text(Strings.active.feedbackSubmit)
                         }
                         Spacer()
                     }
@@ -1303,7 +2078,7 @@ private struct MealIngredientRow: View {
                 .disabled(!canSendFeedback)
 
                 if feedbackStatus == .error {
-                    Text(Fr.feedbackFailure)
+                    Text(Strings.active.feedbackFailure)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -1327,9 +2102,15 @@ private struct MealIngredientRow: View {
                         Text(error.label)
                             .foregroundStyle(PnColor.inkDefault)
                         if let hint {
-                            Text("actuel : \(hint)")
+                            Text(Strings.active.feedbackCurrent(hint))
                                 .font(.caption2)
                                 .foregroundStyle(PnColor.inkSoft)
+                        }
+                        if isActive, let help = Strings.active.feedbackHelp(error.code) {
+                            Text(help)
+                                .font(.caption)
+                                .foregroundStyle(PnColor.inkSoft)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     Spacer()
@@ -1346,10 +2127,29 @@ private struct MealIngredientRow: View {
 
     @ViewBuilder
     private func feedbackDraftInput(for error: FeedbackErrorDef) -> some View {
+        let t = Strings.active
+        VStack(alignment: .leading, spacing: 8) {
+            feedbackDraftField(for: error)
+            HStack {
+                Spacer()
+                Button(t.feedbackAdd) { addFeedbackCorrection() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(feedbackDraftValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(.leading, 8)
+    }
+
+    /// The typed input, labelled "Correct value" rather than repeating the field name just above it.
+    @ViewBuilder
+    private func feedbackDraftField(for error: FeedbackErrorDef) -> some View {
+        let label = Strings.active.feedbackCorrectValue
         HStack(spacing: 8) {
             switch error.input {
             case .select(let options):
-                Picker(error.label, selection: $feedbackDraftValue) {
+                Text(label).font(.caption).foregroundStyle(PnColor.inkSoft)
+                Spacer()
+                Picker(label, selection: $feedbackDraftValue) {
                     ForEach(options) { option in
                         Text(option.label).tag(option.code)
                     }
@@ -1357,9 +2157,10 @@ private struct MealIngredientRow: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
             case .numberUnit(let units):
-                TextField(error.label, text: $feedbackDraftValue)
+                TextField(label, text: $feedbackDraftValue)
                     .keyboardType(.decimalPad)
-                Picker(Fr.feedbackUnitAria, selection: $feedbackDraftUnit) {
+                    .textFieldStyle(.roundedBorder)
+                Picker(Strings.active.feedbackUnitAria, selection: $feedbackDraftUnit) {
                     ForEach(units, id: \.self) { unit in
                         Text(unit).tag(unit)
                     }
@@ -1367,21 +2168,68 @@ private struct MealIngredientRow: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
             case .number(let suffix):
-                TextField(error.label, text: $feedbackDraftValue)
+                TextField(label, text: $feedbackDraftValue)
                     .keyboardType(.decimalPad)
+                    .textFieldStyle(.roundedBorder)
                 if let suffix {
                     Text(suffix).font(.caption).foregroundStyle(PnColor.inkSoft)
                 }
             case .text(let placeholder):
-                TextField(placeholder ?? "", text: $feedbackDraftValue)
+                TextField(placeholder ?? label, text: $feedbackDraftValue, axis: .vertical)
+                    .lineLimit(1...3)
+                    .textFieldStyle(.roundedBorder)
             }
-
-            Button(Fr.feedbackAdd) {
-                addFeedbackCorrection()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(feedbackDraftValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+    }
+
+    /// Everything the app currently believes about this ingredient, folded by default: what a person
+    /// needs in front of them to know whether a value is wrong. Only what the row or the
+    /// `GET /ingredients/{id}` fetch actually carries; nothing is filled in.
+    @ViewBuilder
+    private var feedbackCurrentData: some View {
+        let t = Strings.active
+        let detail = fetchedIngredientDetail
+        feedbackDataRow(t.feedbackTechIngredient, row.ingredientId)
+        feedbackDataRow(t.feedbackTechCooking, t.cookingMethod(row.cookingMethod))
+        feedbackDataRow(t.feedbackTechMeasured, t.feedbackMeasuredState(row.measuredState))
+        if let eat = t.feedbackEatability(raw: detail?.canEatRaw ?? row.canEatRaw, cooked: detail?.canEatCooked) {
+            feedbackDataRow(t.feedbackTechEatability, eat)
+        }
+        feedbackDataRow(t.feedbackTechYields, feedbackYieldsText)
+        feedbackDataRow(t.feedbackTechReferenceWeight, "\(Int(row.basePortionG.rounded())) g")
+        if let units = feedbackCurrentValue(for: .servingUnits) { feedbackDataRow(t.feedbackTechUnits, units) }
+        if let group = feedbackCurrentValue(for: .foodGroup) { feedbackDataRow(t.feedbackTechFoodGroup, group) }
+        if let nutrition = detail?.referenceNutrition {
+            feedbackDataRow(t.feedbackTechPer100, feedbackNutritionText(nutrition))
+        } else if detail == nil {
+            Text(t.feedbackCurrentDataLoading).font(.caption).foregroundStyle(PnColor.inkSoft)
+        }
+    }
+
+    private func feedbackDataRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(PnColor.inkSoft)
+            Text(value).font(.caption).foregroundStyle(PnColor.inkDefault).textSelection(.enabled)
+        }
+    }
+
+    /// "Grillé 75 % · Bouilli 110 %": every yield Knowledge holds, sorted, as cooked/raw percentages.
+    private var feedbackYieldsText: String {
+        let t = Strings.active
+        guard !row.yieldFactors.isEmpty else { return t.feedbackTechYieldNone }
+        return row.yieldFactors.sorted { $0.key < $1.key }
+            .map { "\(t.cookingMethod($0.key)) \(Int(($0.value * 100).rounded())) %" }
+            .joined(separator: " · ")
+    }
+
+    private func feedbackNutritionText(_ n: ReferenceNutrition) -> String {
+        var parts: [String] = []
+        if let v = n.energyKcal { parts.append("\(Int(v.rounded())) kcal") }
+        if let v = n.proteinG { parts.append("P \(formatFrenchNumber(v)) g") }
+        if let v = n.carbohydratesG { parts.append("G \(formatFrenchNumber(v)) g") }
+        if let v = n.fatG { parts.append("L \(formatFrenchNumber(v)) g") }
+        if let v = n.fiberG { parts.append("F \(formatFrenchNumber(v)) g") }
+        return parts.joined(separator: " · ")
     }
 
     private func selectFeedbackError(category: String, error: FeedbackErrorDef) {
@@ -1444,10 +2292,12 @@ private struct MealIngredientRow: View {
         case .displayUnit:
             return row.displayUnit
         case .servingUnits:
-            return row.servingUnits.isEmpty ? "aucune" : row.servingUnits.map(\.labelFr).joined(separator: ", ")
+            return row.servingUnits.isEmpty ? "aucune" : row.servingUnits
+                .map { pickLocalized($0.labels, preferring: "fr") ?? $0.unit }
+                .joined(separator: ", ")
         case .rawCooked:
-            guard let canEatRaw = row.canEatRaw else { return nil }
-            return canEatRaw ? "cru possible" : "cuisson requise"
+            return Strings.active.feedbackEatability(
+                raw: fetchedIngredientDetail?.canEatRaw ?? row.canEatRaw, cooked: fetchedIngredientDetail?.canEatCooked)
         case .cookingMethod:
             return row.cookingMethod
         case .energy:
@@ -1466,12 +2316,19 @@ private struct MealIngredientRow: View {
             guard let value = fetchedIngredientDetail?.referenceNutrition?.fiberG else { return nil }
             return "\(formatFrenchNumber(value)) g"
         case .nameFr:
-            return fetchedIngredientDetail?.nameFr
+            // A strict lookup, not `pickLocalized`: this hint asks specifically "what French name does
+            // Knowledge have", and `pickLocalized`'s fallback would show the English name mislabelled
+            // as French when only that one exists — the opposite of what the hint is asking.
+            return fetchedIngredientDetail?.names.first { $0.lang == "fr" }?.text
         case .nameEn:
-            return fetchedIngredientDetail?.nameEn
+            return fetchedIngredientDetail?.names.first { $0.lang == "en" }?.text
         case .foodGroup:
             guard let code = fetchedIngredientDetail?.foodGroup else { return nil }
             return FeedbackCatalog.foodGroups.first { $0.code == code }?.label ?? code
+        case .yieldFactor:
+            guard row.cookingMethod != "raw", !row.yieldFactors.isEmpty else { return nil }
+            let factor = resolveYieldFactor(row.yieldFactors, method: row.cookingMethod)
+            return "\(Int((factor * 100).rounded())) %"
         }
     }
 
@@ -1500,4 +2357,17 @@ private struct MealIngredientRow: View {
             feedbackStatus = .error
         }
     }
+}
+
+
+/// What the last dictation did to the meal.
+private enum DictationNotice {
+    case added(Int)
+    case partly(added: Int, names: String)
+    /// Nothing could be added: the review screen for this entry is offered.
+    case nothing(String)
+}
+
+private struct DictationReviewTarget: Identifiable {
+    let id: String
 }

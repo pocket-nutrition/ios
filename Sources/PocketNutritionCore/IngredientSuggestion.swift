@@ -10,10 +10,10 @@
 ///
 /// Most fields are optional in the spec and genuinely absent in practice: `nutrition` came back null
 /// for every result when this was written. Fields the spec defines but nothing reads (`nutrition`,
-/// `densityGMl`, `unitLabelFr`, `unitLabelEn`) are deliberately *not* declared — `Decodable` ignores
-/// unknown keys, so they decode away harmlessly, and declaring them would suggest something consults
-/// them. That also means two suggestions comparing equal here have only compared the fields that
-/// affect behaviour, which is the comparison the vectors make.
+/// `densityGMl`, `unitLabels`) are deliberately *not* declared — `Decodable` ignores unknown keys, so
+/// they decode away harmlessly, and declaring them would suggest something consults them. That also
+/// means two suggestions comparing equal here have only compared the fields that affect behaviour,
+/// which is the comparison the vectors make.
 public struct IngredientSuggestion: Equatable, Sendable, Decodable, Identifiable {
     public let ingredientId: String
     public let label: String

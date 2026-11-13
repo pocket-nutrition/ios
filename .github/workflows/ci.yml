@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: MPL-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# What this verifies
+#
+#   contracts  the vendored contract/ is the one CONTRACTS_VERSION pins
+#   core       PocketNutritionCore (the behavioural contract shared with the web client and Android)
+#              builds warning-free and passes its tests, on Linux
+#   app        the SwiftUI app target compiles for the iOS simulator, on macOS
+#
+# What it does not do: sign, archive, or produce an IPA. A release here is a CalVer tag and a GitHub
+# Release with generated notes; the app itself is archived by hand on a Mac (see README).
+jobs:
+  # First because it takes seconds, and drift here invalidates everything after it.
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          path: pocket-nutrition-ios
+
+      # Checked out beside this repo, which is the layout sync-contracts.sh expects by default.
+      - name: Checkout pocket-nutrition-contracts
+        uses: actions/checkout@v5
+        with:
+          repository: pocket-nutrition/contracts
+          path: pocket-nutrition-contracts
+
+      # Fails when the vendored contract/ differs from the pinned CONTRACTS_VERSION, or when the
+      # contracts repo is not at that version. Either means this client is being built against
+      # something nobody reviewed it against.
+      - name: Vendored contract matches the pinned version
+        run: ./scripts/sync-contracts.sh --verify
+        working-directory: pocket-nutrition-ios
+
+  # Build and test the shared behavioural core on Linux, with the exact toolchain it was developed on.
+  core:
+    needs: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: swift:6.3.3-noble
+    steps:
+      - uses: actions/checkout@v5
+
+      # Separate from the test step so a compile failure is distinguishable at a glance from a
+      # behavioural one.
+      #
+      # -warnings-as-errors is passed here rather than declared in Package.swift on purpose. As a
+      # manifest setting it conflicts with the -suppress-warnings that Xcode applies to package
+      # dependencies, and the app target stops building. The strictness belongs to CI anyway.
+      - name: Build
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+
+      # The corpus is read from the checkout via #filePath rather than from a resource bundle, so
+      # these tests need the source tree present, which after checkout it is.
+      - name: Test
+        run: swift test --skip-build
+
+  # The SwiftUI app cannot build on Linux, so this is what gates it. Compile-only: signing is switched
+  # off and the destination is the generic simulator. It has to be `-scheme`: a `-target` build cannot
+  # resolve the Sodium package product that PocketNutritionVault needs.
+  app:
+    needs: contracts
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Xcode project refuses to build without a base configuration file, on purpose. CI has no
+      # signing team and needs none, so the template is enough.
+      - name: Create Local.xcconfig
+        run: cp Local.xcconfig.example Local.xcconfig
+
+      - name: Build app (simulator, unsigned)
+        run: |
+          xcodebuild -project PocketNutrition.xcodeproj -scheme PocketNutrition \
+            -destination 'generic/platform=iOS Simulator' -configuration Debug CODE_SIGNING_ALLOWED=NO build
+
+  # The single required status check.
+  ci-success:
+    name: ci-success
+    needs: [contracts, core, app]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if a required job failed or was cancelled
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          case "$RESULTS" in *failure*|*cancelled*) exit 1 ;; esac
+
+  # Every merge to main gets a CalVer tag (vYYYY.M.N) and a GitHub Release with generated notes.
+  release:
+    needs: ci-success
+    if: github.event_name == 'push' && needs.ci-success.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Reserve the CalVer tag
+        id: version
+        run: echo "version=$(.github/scripts/calver-reserve.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Create the GitHub Release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v${VERSION}" --verify-tag --generate-notes --title "v${VERSION}"
+
+      # The tag was reserved before the release existed; if the release did not get created, free the
+      # number rather than leave a tag with nothing behind it.
+      - name: Release the tag if the release failed
+        if: failure() && steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/v${VERSION}"
+          fi

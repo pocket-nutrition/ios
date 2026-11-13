@@ -93,15 +93,12 @@ See README for the full two-tier rationale. Operationally:
 
 ## CI notes
 
-No CI pipeline is included yet. If you set one up, note that most container-based Actions runners
-need a `node` binary in the build image even though nothing here is JavaScript — `actions/checkout`
-and similar actions run as JavaScript *inside* the job container, and without `node` those steps
-fail at checkout with `exec: "node": executable file not found` (exit 127).
+CI lives in `.github/workflows/ci.yml` and has three gates: `./scripts/sync-contracts.sh --verify`,
+`swift build`/`swift test` on `PocketNutritionCore` on Linux (in the official `swift` image, which already
+ships `node` for the checkout action), and an unsigned simulator build of the app target on macOS.
 
-CI cannot build the app target itself: SwiftUI and the iOS SDK are Apple-only, so there is
-deliberately no macOS runner. A CI workflow can only run `swift test` on `PocketNutritionCore` and
-`./scripts/sync-contracts.sh --verify` — a job that cannot build the app should say so rather than
-pretend otherwise.
+The Linux job cannot build the app: SwiftUI and the iOS SDK are Apple-only. That is why the core stays a
+separate package, and why Apple-only imports must never be added to it.
 
 ## Environment notes
 
@@ -118,14 +115,15 @@ a CI result mean the same thing.
 
 ### The app target needs an Xcode platform component
 
-Building the app by **target** works with only the SDK present:
+Building the app by **target** used to work with only the SDK present, but no longer does: a `-target`
+build cannot resolve the Sodium package product that `PocketNutritionVault` depends on. Build by scheme:
 
 ```bash
-xcodebuild -project PocketNutrition.xcodeproj -target PocketNutrition \
-  -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project PocketNutrition.xcodeproj -scheme PocketNutrition \
+  -destination 'generic/platform=iOS Simulator' -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-Building or running by **scheme** additionally needs a destination, and therefore the iOS platform
+Building or running by **scheme** needs a destination, and therefore the iOS platform
 component installed (Xcode → Settings → Components). Without it every scheme build fails with
 
 ```
@@ -136,5 +134,5 @@ error: Unable to find a destination matching the provided destination specifier
 which names a destination problem rather than the missing component that causes it. This is a
 several-gigabyte download and is not something to trigger on someone's machine unasked.
 
-Note that `-target` succeeding while `-scheme` fails is not a contradiction: the former only compiles,
-the latter resolves a device or simulator to build *for*. Compilation is genuinely verified either way.
+CI uses the generic simulator destination (`generic/platform=iOS Simulator`), which compiles without
+booting or choosing a particular simulator.

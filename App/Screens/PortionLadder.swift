@@ -112,7 +112,7 @@ struct PortionLadder: View {
     /// finish typing a weight also ended the whole compose session, which is a far more consequential
     /// mistake than the stuck keyboard this replaces.
     private var confirmButton: some View {
-        Button(Fr.done) { isValueFieldFocused = false }
+        Button(Strings.active.done) { isValueFieldFocused = false }
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(PnRole.buttonPrimaryForeground)
             .padding(.horizontal, 28)
@@ -187,7 +187,8 @@ struct PortionLadder: View {
         HStack(spacing: 8) {
             ForEach(Array(shortcutProfile(
                 servingUnits: row.servingUnits,
-                displayUnit: row.displayUnit
+                displayUnit: row.displayUnit,
+                lang: LanguageSettings.shared.effective
             ).enumerated()), id: \.offset) { _, shortcut in
                 switch shortcut {
                 case .multiplier(let label, let factor):

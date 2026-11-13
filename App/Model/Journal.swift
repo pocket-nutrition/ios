@@ -2,6 +2,7 @@
 
 import Foundation
 import Observation
+import PocketNutritionCore
 
 /// One food inside a meal, as the user is composing it or as it was saved.
 ///
@@ -16,6 +17,14 @@ struct MealItem: Codable, Identifiable, Hashable, Sendable {
     var quantityG: Double
     var cookingMethod: String
     var measuredState: String
+    /// Set only on a quick-add item: an energy figure the person typed, with no ingredient behind it.
+    var energyKcal: Double?
+    /// `false` when the server could not compute the item: no nutrition data, and left out of the meal's
+    /// totals. Stored only as `false`; absent (every meal saved before the field existed) means available.
+    var available: Bool?
+
+    var isQuickAdd: Bool { ingredientId == nil && energyKcal != nil }
+    var isAvailable: Bool { available ?? true }
 
     func asRequest() -> FoodItemRequest {
         FoodItemRequest(
@@ -71,6 +80,23 @@ struct SavedMeal: Codable, Identifiable, Hashable, Sendable {
     var savedAt: Date
     var items: [MealItem]
     var totals: Macros
+    /// Last edit, for settling two devices' edits of the same meal. Absent in files written before the
+    /// vault sync: such a meal counts as last edited when it was saved.
+    var updatedAt: Date?
+    /// The part of the day. Absent in meals saved before slots existed: `effectiveSlot` derives it from
+    /// the time instead, without rewriting the meal.
+    var slot: MealSlot?
+    /// Every nutrient the engine returned, summed over the items. Absent in older meals.
+    var nutrients: NutrientTotals?
+
+    var modifiedAt: Date { updatedAt ?? savedAt }
+    var effectiveSlot: MealSlot { slot ?? mealSlot(for: savedAt) }
+}
+
+/// What changed in the journal because of the person, as opposed to what arrived from the vault.
+enum JournalChange {
+    case saved(UUID)
+    case deleted(UUID)
 }
 
 /// The on-disk shape, versioned from the first write.
@@ -83,7 +109,8 @@ private struct JournalFile: Codable {
     var meals: [SavedMeal]
 }
 
-/// The local diary. This is the app's one piece of user data, and it never leaves the device.
+/// The local diary. The working copy of the app's one piece of user data: it stays on the device, and
+/// when a vault account is linked `JournalSyncCoordinator` keeps an encrypted copy there.
 ///
 /// WHY A JSON FILE RATHER THAN CORE DATA OR SWIFTDATA
 /// The whole store is a list of meals appended to and occasionally deleted from: no relationships, no
@@ -94,6 +121,9 @@ private struct JournalFile: Codable {
 final class JournalStore {
 
     private(set) var meals: [SavedMeal] = []
+
+    /// Told about every change the person makes, never about what `apply` writes from the vault.
+    var onChange: ((JournalChange) -> Void)?
 
     private let fileURL: URL
     private let encoder = JSONEncoder()
@@ -132,21 +162,52 @@ final class JournalStore {
             .sorted { $0.day > $1.day }
     }
 
-    func save(items: [MealItem], totals: Macros, at date: Date = Date()) {
-        meals.append(SavedMeal(savedAt: date, items: items, totals: totals))
+    func save(
+        items: [MealItem], totals: Macros, at date: Date = Date(), slot: MealSlot? = nil,
+        nutrients: NutrientTotals? = nil
+    ) {
+        let meal = SavedMeal(
+            savedAt: date, items: items, totals: totals, updatedAt: Date(),
+            slot: slot ?? mealSlot(for: date), nutrients: nutrients)
+        meals.append(meal)
         persist()
+        onChange?(.saved(meal.id))
     }
 
     func delete(_ meal: SavedMeal) {
         meals.removeAll { $0.id == meal.id }
         persist()
+        onChange?(.deleted(meal.id))
     }
 
     /// Replaces an existing entry's items and totals in place, keeping its original `savedAt`.
-    func update(id: UUID, items: [MealItem], totals: Macros) {
+    func update(
+        id: UUID, items: [MealItem], totals: Macros, savedAt: Date? = nil, slot: MealSlot? = nil,
+        nutrients: NutrientTotals? = nil
+    ) {
         guard let index = meals.firstIndex(where: { $0.id == id }) else { return }
         meals[index].items = items
         meals[index].totals = totals
+        if let savedAt { meals[index].savedAt = savedAt }
+        if let slot { meals[index].slot = slot }
+        if let nutrients { meals[index].nutrients = nutrients }
+        meals[index].updatedAt = Date()
+        persist()
+        onChange?(.saved(id))
+    }
+
+    /// Writes what the vault sync brought in: meals new from another device or edited there, and meals
+    /// deleted there. One write, and no `onChange`, since none of it needs sending back.
+    func apply(upserts: [SavedMeal], deletes: Set<UUID>) {
+        guard !upserts.isEmpty || !deletes.isEmpty else { return }
+        meals.removeAll { deletes.contains($0.id) }
+        for meal in upserts {
+            if let index = meals.firstIndex(where: { $0.id == meal.id }) {
+                meals[index] = meal
+            } else {
+                meals.append(meal)
+            }
+        }
         persist()
     }
 

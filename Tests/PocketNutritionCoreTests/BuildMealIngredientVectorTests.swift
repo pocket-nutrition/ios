@@ -106,7 +106,7 @@ struct BuildMealIngredientVectorTests {
         let milk = IngredientSuggestion(
             ingredientId: "milk", label: "lait", lang: "fr",
             servingG: 200, displayUnit: "ml", typicalState: "raw", portionMeasuredState: "raw",
-            servingUnits: [ServingUnit(unit: "glass", labelFr: "verre", volumeMl: 200, grams: 206)]
+            servingUnits: [ServingUnit(unit: "glass", labels: [LocalizedText(lang: "fr", text: "verre")], volumeMl: 200, grams: 206)]
         )
 
         let byVolume = try #require(buildMealIngredient(AddItem(suggestion: milk), id: "i"))

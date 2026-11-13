@@ -40,10 +40,10 @@ swift test -Xswiftc -warnings-as-errors
 # The contract has not drifted from its pin.
 ./scripts/sync-contracts.sh --verify
 
-# The app target. -target rather than -scheme: a scheme build resolves a destination and so needs
-# the iOS platform component installed, whereas this needs only the SDK.
-xcodebuild -project PocketNutrition.xcodeproj -target PocketNutrition \
-  -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
+# The app target, unsigned. It has to be a scheme build: `-target` cannot resolve the Sodium package
+# product that PocketNutritionVault depends on. A scheme build needs the iOS platform component.
+xcodebuild -project PocketNutrition.xcodeproj -scheme PocketNutrition \
+  -destination 'generic/platform=iOS Simulator' -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
 ### Running it on a device
@@ -131,14 +131,14 @@ security cms -D -i "$APP/embedded.mobileprovision" | plutil -p - | grep -A3 -E "
 ```bash
 # Compiles against the device SDK without needing a signing identity at all — the fastest way to
 # tell a code problem apart from a signing one.
-xcodebuild -project PocketNutrition.xcodeproj -target PocketNutrition \
-  -sdk iphoneos -configuration Debug CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project PocketNutrition.xcodeproj -scheme PocketNutrition \
+  -destination 'generic/platform=iOS' -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-CI cannot build the app: SwiftUI and the iOS SDK are Apple-only, and there is deliberately no macOS
-runner. That boundary is the reason the core is a separate, dependency-free package — the rules that
-must not drift across three clients are gated on every push, and the UI is the part a person looks at
-anyway.
+CI builds the app too, on a macOS runner (for the simulator, unsigned). The core is still a separate,
+dependency-free package so that the rules that must not drift across three clients are also tested on
+Linux, where the SwiftUI app cannot build. CI produces no installable binary: archiving and signing
+stay a manual step on a Mac.
 
 ## Contributing
 

@@ -5,9 +5,11 @@ import Testing
 /// Structural checks over the whole vendored corpus, independent of whether Swift implements any given
 /// suite yet.
 ///
-/// **Every suite is implemented and asserted — 144 of 144 cases across 17 suites.** The counts are not
+/// **Every suite is implemented and asserted — 190 of 190 cases across 23 suites.** The counts are not
 /// restated in the assertions below: those read `index.json`, so this comment is the only thing that can
 /// go stale, and a suite added upstream without a port here fails `required` rather than this prose.
+/// Six of the 23 (the `-en` siblings) are hand-authored rather than sandbox-generated — see
+/// `vectors/README.md` — but are ported and asserted the same as every other suite.
 ///
 /// This file therefore no longer covers for any gap. It still earns its place: it proves the corpus
 /// arrived intact and matches `index.json`, which is what fails loudly if a half-finished
@@ -21,20 +23,32 @@ struct CorpusIntegrityTests {
         "apply-method-change",
         "switch-measured-state",
         "build-anchors",
+        "build-anchors-en",
         "build-meal-ingredient",
         "deduplicate-suggestions",
         "selection-mode",
         "describe-quantity",
+        "describe-quantity-en",
+        "english-number",
+        "english-plural",
         "food-group-icon",
         "french-number",
         "french-plural",
         "rounding",
         "serving-unit-emoji",
         "shortcut-profile",
+        "shortcut-profile-en",
         "step-label",
+        "step-label-en",
         "step-raw-weight",
         "unpack-recipe",
-        "yield-factor"
+        "yield-factor",
+        "daily-targets",
+        "weight-for-day",
+        "profile-for-day",
+        "apply-target-overrides",
+        "day-progress",
+        "self-comparison",
     ]
 
     @Test("every declared suite loads and matches its declared count")
