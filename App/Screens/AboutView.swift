@@ -153,7 +153,7 @@ struct AboutView: View {
     /// The same URL the App Store Connect listing declares. Force-unwrapped deliberately: these are
     /// two compile-time literals, and a typo should be caught by the launch of the screen in review
     /// rather than silently rendering a dead row.
-    private static let privacyPolicyURL = URL(string: "https://website.pocketnutrition.org/privacy.html")!
+    private static let privacyPolicyURL = URL(string: "https://pocketnutrition.org/privacy.html")!
 
     private static let sourceURL = URL(string: "https://github.com/pocket-nutrition/ios")!
 }
